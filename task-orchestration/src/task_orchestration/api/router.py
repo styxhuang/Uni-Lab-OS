@@ -47,7 +47,11 @@ def create_router(store: WorkspaceStore, service: WorkspaceService | None = None
             status_code=404
             if exc.code in {"template_not_found", "instance_not_found"}
             else 409,
-            detail={"code": exc.code, "message": str(exc)},
+            detail={
+                "code": exc.code,
+                "message": str(exc),
+                **({"detail": exc.detail} if exc.detail else {}),
+            },
         )
 
     def mutation_error(exc: Exception) -> HTTPException:
@@ -83,21 +87,25 @@ def create_router(store: WorkspaceStore, service: WorkspaceService | None = None
     @router.put("/workspaces")
     def put_workspace(request: WorkspaceUpdateRequest) -> dict:
         try:
+            current = store.get(request.workspace.workflow_path)
+            if request.workspace.templates != current.workspace.templates:
+                raise WorkspaceServiceError(
+                    "template_write_requires_compilation",
+                    "模板契约只能通过模板创建或更新 API 编译",
+                )
             return public_workspace_response(store.put(
                 request.workspace.model_copy(
                     update={"dynamic_resource_leases": []}
                 ),
                 expected_version=request.expected_version,
             ))
-        except VersionConflictError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except SidecarCorruptionError as exc:
-            raise HTTPException(
-                status_code=422,
-                detail="invalid task workspace sidecar",
-            ) from exc
-        except WorkflowPathError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except (
+            VersionConflictError,
+            WorkspaceServiceError,
+            SidecarCorruptionError,
+            WorkflowPathError,
+        ) as exc:
+            raise mutation_error(exc) from exc
 
     @router.post("/workspaces/reset")
     def reset_workspace(request: WorkspaceResetRequest) -> dict:
@@ -127,8 +135,7 @@ def create_router(store: WorkspaceStore, service: WorkspaceService | None = None
                 request.expected_version,
                 template_id,
                 name=request.name,
-                input_triggers=request.input_triggers,
-                output_triggers=request.output_triggers,
+                node_ids=request.node_ids,
             ))
         except (VersionConflictError, WorkspaceServiceError, SidecarCorruptionError, WorkflowPathError) as exc:
             raise mutation_error(exc) from exc

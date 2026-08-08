@@ -13,7 +13,6 @@ class SzlabRobotS06Mixin:
             task_number=11,
             variables=None,
             reset_variables={"任务号": 0},
-            precheck=lambda: self._ensure_sensor_gate(S06_MATERIAL_SENSOR, False, "S06 放料目标位必须为空"),
             target_sensor_variable=S06_MATERIAL_SENSOR,
         )
 
@@ -24,6 +23,5 @@ class SzlabRobotS06Mixin:
             task_number=12,
             variables=None,
             reset_variables={"任务号": 0},
-            precheck=lambda: self._ensure_sensor_gate(S06_MATERIAL_SENSOR, True, "S06 取料源位必须有物料"),
             source_sensor_variable=S06_MATERIAL_SENSOR,
         )

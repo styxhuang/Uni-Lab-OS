@@ -447,11 +447,9 @@ _METHOD_PARAM_HELP: dict[tuple[str, str], dict[str, Any]] = {
     ("submit_place_to_s04", "position"): {"description": "S04 磁搅工位编号，范围 1–6。"},
     ("submit_pick_from_s04", "position"): {"description": "S04 磁搅工位编号，范围 1–6。"},
     ("submit_place_to_s071", "position"): {
-        "description": "S071 粉罐仓位，PLC 编号范围 1–6；前端使用“行-列”格式，填 auto 时自动选择空位。"
+        "description": "S071 粉罐仓位，PLC 编号范围 1–6；必须明确指定“行-列”格式槽位，例如 1-1。"
     },
     ("submit_pick_from_s071", "position"): {"description": "S071 粉罐仓位，PLC 编号范围 1–6；前端使用“行-列”格式，例如 1-1。"},
-    ("submit_place_to_s072", "position"): {"description": "兼容参数；S072 产品类型由 S072取放料产品 决定。"},
-    ("submit_pick_from_s072", "position"): {"description": "兼容参数；S072 产品类型由 S072取放料产品 决定。"},
     ("submit_place_to_s08", "position"): {"description": "S08 开关盖工位：1=样品瓶，2=100 mL 液体瓶。"},
     ("submit_pick_from_s08", "position"): {"description": "S08 开关盖工位：1=样品瓶，2=100 mL 液体瓶。"},
     ("submit_place_to_s10", "position"): {"description": "S10 液体试剂瓶仓位，范围 1–20。"},

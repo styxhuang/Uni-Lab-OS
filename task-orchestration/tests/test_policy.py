@@ -6,11 +6,12 @@ from task_orchestration.policy import FifoResourcePolicy
 
 def _template(template_id: str, resources: list[str]) -> Template:
     return Template(
+        schema_version=2,
         id=template_id,
         name=template_id,
         workflow_path="demo.json",
         node_ids=[],
-        resources=resources,
+        resource_requirements=resources,
     )
 
 

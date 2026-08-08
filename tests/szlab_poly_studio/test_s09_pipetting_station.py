@@ -717,7 +717,7 @@ def test_s09_debug_csv_is_small_plc_input_with_remaining_volume_names():
     assert "S09参数写入完成" in text
 
 
-def test_s09_robot_actions_use_dev_robot_s09_task_contract(monkeypatch):
+def test_s09_robot_actions_expose_task_owned_logical_occupancy(monkeypatch):
     monkeypatch.setenv("SKIP_ROBOT_HANDSHAKE_CHECK", "1")
 
     class FakePlcGateway:
@@ -768,7 +768,10 @@ def test_s09_robot_actions_use_dev_robot_s09_task_contract(monkeypatch):
 
     assert result["success"] is True
     assert result["target_sensor_variable"] == "传感器状态_上位机[4].NO[6]"
-    assert result["sensor_check_skipped"] is True
+    assert result["resolved_contract"]["effects"][0]["source"] == "occupancy"
+    assert result["effect_verification"]["skipped_logical_effects"] == [
+        "occupancy:szlab_mixer_robot:S09:1:2"
+    ]
     assert "传感器状态_上位机[4].NO[6]" not in gateway.reads
     assert gateway.writes == [
         ("S09取放料产品", 1),

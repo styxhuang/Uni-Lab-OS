@@ -18,6 +18,16 @@ from task_orchestration.store import (
 )
 
 
+def _empty_contract(node_id: str) -> dict:
+    return {
+        "node_id": node_id,
+        "contract_state": "empty",
+        "preconditions": [],
+        "effects": [],
+        "resources": [],
+    }
+
+
 def test_get_returns_default_workspace_for_workflow(tmp_path):
     workflow = tmp_path / "workflows" / "demo.json"
     workflow.parent.mkdir()
@@ -107,6 +117,35 @@ def test_get_and_put_reject_sidecar_symlink(tmp_path):
         store.put(Workspace(workflow_path="demo.json"), expected_version=0)
 
 
+def test_read_workflow_accepts_normal_nested_path(tmp_path):
+    workflow = tmp_path / "nested" / "demo.json"
+    workflow.parent.mkdir()
+    workflow.write_text('{"nodes": []}', encoding="utf-8")
+
+    assert WorkspaceStore(tmp_path).read_workflow("nested/demo.json") == {
+        "nodes": []
+    }
+
+
+def test_read_workflow_rejects_file_symlink_inside_workspace(tmp_path):
+    target = tmp_path / "target.json"
+    target.write_text('{"nodes": []}', encoding="utf-8")
+    (tmp_path / "linked.json").symlink_to(target)
+
+    with pytest.raises(WorkflowPathError):
+        WorkspaceStore(tmp_path).read_workflow("linked.json")
+
+
+def test_read_workflow_rejects_directory_symlink_inside_workspace(tmp_path):
+    target_dir = tmp_path / "real"
+    target_dir.mkdir()
+    (target_dir / "demo.json").write_text('{"nodes": []}', encoding="utf-8")
+    (tmp_path / "linked").symlink_to(target_dir, target_is_directory=True)
+
+    with pytest.raises(WorkflowPathError):
+        WorkspaceStore(tmp_path).read_workflow("linked/demo.json")
+
+
 @pytest.mark.parametrize(
     "contents",
     [
@@ -118,6 +157,51 @@ def test_corrupt_sidecar_raises_dedicated_error(tmp_path, contents):
     workflow = tmp_path / "demo.json"
     workflow.write_text("{}", encoding="utf-8")
     (tmp_path / "demo.json.task-workspace.json").write_text(contents, encoding="utf-8")
+
+    with pytest.raises(SidecarCorruptionError):
+        WorkspaceStore(tmp_path).get("demo.json")
+
+
+@pytest.mark.parametrize(
+    "node_contracts",
+    [
+        [_empty_contract("first")],
+        [
+            _empty_contract("first"),
+            _empty_contract("second"),
+            _empty_contract("extra"),
+        ],
+        [
+            _empty_contract("second"),
+            _empty_contract("first"),
+        ],
+    ],
+    ids=["missing", "extra", "wrong-order"],
+)
+def test_sidecar_rejects_node_contracts_not_matching_node_ids(
+    tmp_path, node_contracts
+):
+    (tmp_path / "demo.json").write_text("{}", encoding="utf-8")
+    sidecar = {
+        "version": 1,
+        "workspace": {
+            "workflow_path": "demo.json",
+            "templates": [
+                {
+                    "schema_version": 2,
+                    "id": "template",
+                    "name": "Template",
+                    "node_ids": ["first", "second"],
+                    "node_contracts": node_contracts,
+                    "admission_gates": [],
+                    "resource_requirements": [],
+                }
+            ],
+        },
+    }
+    (tmp_path / "demo.json.task-workspace.json").write_text(
+        json.dumps(sidecar), encoding="utf-8"
+    )
 
     with pytest.raises(SidecarCorruptionError):
         WorkspaceStore(tmp_path).get("demo.json")
@@ -144,3 +228,5 @@ def test_store_rejects_workflow_paths_outside_workspace(tmp_path, workflow_path)
 
     with pytest.raises(WorkflowPathError):
         store.get(workflow_path)
+    with pytest.raises(WorkflowPathError):
+        store.read_workflow(workflow_path)

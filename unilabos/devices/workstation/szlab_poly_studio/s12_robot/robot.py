@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
-from typing import Any
+from typing import Any, Literal
 
-from unilabos.registry.decorators import ActionInputHandle, DataSource, action, device, not_action
-from unilabos.devices.workstation.szlab_poly_studio.sensor import wait_sensor_conditions
+from unilabos.registry.action_contract import resolve_action_contract
+from unilabos.registry.decorators import (
+    ActionInputHandle,
+    DataSource,
+    action,
+    device,
+    get_action_meta,
+    not_action,
+)
 from unilabos.devices.workstation.szlab_poly_studio.s12_robot.robot_tasks import (
+    ROBOT_ACTION_SPECS,
     ROBOT_HOME_VARIABLE,
     ROBOT_TASK_COMPLETE_VARIABLE,
     ROBOT_TASK_NUMBER_VARIABLE,
@@ -50,14 +59,19 @@ class SzlabMixerRobotDevice(
         plc_device_id: str = "szlab_poly_plc",
         poll_interval: float = 1.0,
         write_done_hold_seconds: float = 0.0,
+        effect_settle_timeout: float = 0.5,
+        effect_poll_interval: float = 0.05,
         *args,
         **kwargs,
     ):
         self.plc_device_id = plc_device_id
         self.poll_interval = float(poll_interval)
         self.write_done_hold_seconds = float(write_done_hold_seconds)
+        self.effect_settle_timeout = max(0.0, float(effect_settle_timeout))
+        self.effect_poll_interval = max(0.001, float(effect_poll_interval))
         self._plc_gateway = None
         self._last_task: dict[str, Any] = {}
+        self._robot_task_lock = threading.RLock()
 
     @not_action
     def set_plc_gateway(self, plc_gateway) -> None:
@@ -74,6 +88,96 @@ class SzlabMixerRobotDevice(
         if self._plc_gateway is None:
             raise RuntimeError("机器人任务需要注入 szlab_poly_plc 网关")
         return self._plc_gateway.read_variable(name, use_cache=use_cache)
+
+    @not_action
+    def _resolved_action_contract(
+        self,
+        method_name: str,
+        parameters: dict[str, Any],
+    ) -> dict[str, Any]:
+        method = getattr(type(self), method_name)
+        meta = get_action_meta(method)
+        if meta is None or meta.get("contract") is None:
+            raise RuntimeError(f"S12 Action 缺少声明式契约: {method_name}")
+        return resolve_action_contract(meta["contract"], parameters)
+
+    @not_action
+    def _assert_contract_conditions(
+        self,
+        resolved_contract: dict[str, Any],
+    ) -> dict[str, Any]:
+        mismatches: list[dict[str, Any]] = []
+        values: dict[str, Any] = {}
+        skipped_logical_conditions: list[str] = []
+        for condition in resolved_contract["opc_conditions"]:
+            variable = str(condition["variable"])
+            if condition.get("source", "opc") == "occupancy":
+                skipped_logical_conditions.append(variable)
+                continue
+            expected = condition["expected"]
+            actual = self._read_variable(variable, use_cache=False)
+            values[variable] = actual
+            if actual != expected:
+                mismatches.append(
+                    {
+                        "variable": variable,
+                        "expected": expected,
+                        "actual": actual,
+                    }
+                )
+        return {
+            "success": not mismatches,
+            "values": values,
+            "mismatches": mismatches,
+            "skipped_logical_conditions": skipped_logical_conditions,
+        }
+
+    @not_action
+    def _verify_contract_effects(
+        self,
+        resolved_contract: dict[str, Any],
+    ) -> dict[str, Any]:
+        mismatches: list[dict[str, Any]] = []
+        values: dict[str, Any] = {}
+        attempts: dict[str, int] = {}
+        skipped_logical_effects: list[str] = []
+        timed_out = False
+        for effect in resolved_contract["effects"]:
+            variable = str(effect["variable"])
+            if effect.get("source", "opc") == "occupancy":
+                skipped_logical_effects.append(variable)
+                continue
+            expected = effect["expected"]
+            started_at = time.monotonic()
+            count = 0
+            while True:
+                count += 1
+                actual = self._read_variable(variable, use_cache=False)
+                if actual == expected:
+                    break
+                if time.monotonic() - started_at >= self.effect_settle_timeout:
+                    timed_out = True
+                    break
+                time.sleep(self.effect_poll_interval)
+            attempts[variable] = count
+            values[variable] = actual
+            if actual != expected:
+                mismatches.append(
+                    {
+                        "variable": variable,
+                        "expected": expected,
+                        "actual": actual,
+                        "reason": "effect_settle_timeout",
+                    }
+                )
+        return {
+            "success": not mismatches,
+            "values": values,
+            "mismatches": mismatches,
+            "attempts": attempts,
+            "timed_out": timed_out,
+            "skipped_logical_effects": skipped_logical_effects,
+        }
 
     @not_action
     def _wait_variable_equal(
@@ -110,116 +214,6 @@ class SzlabMixerRobotDevice(
             if bool(last_value):
                 return True, last_value
             time.sleep(poll_interval)
-
-    @not_action
-    def _ensure_sensor_gate(self, sensor_variable: str, expected: bool, message: str) -> dict[str, Any] | None:
-        if os.environ.get("SKIP_SENSOR_PRECHECK") == "1":
-            return None
-        if not sensor_variable:
-            return {"success": False, "message": "缺少精确传感器变量，不能执行机器人取放料动作"}
-        if self._should_skip_robot_precheck_variable(sensor_variable):
-            return None
-        actual = bool(self._read_variable(sensor_variable, use_cache=False))
-        if actual == expected:
-            return None
-        return {
-            "success": False,
-            "message": message,
-            "sensor_variable": sensor_variable,
-            "expected": expected,
-            "actual": actual,
-        }
-
-    @not_action
-    def _wait_sensor_conditions(
-        self,
-        conditions: dict[str, bool],
-        *,
-        phase: str,
-    ) -> dict[str, Any]:
-        if os.environ.get("SKIP_SENSOR_PRECHECK") == "1":
-            return {
-                "success": True,
-                "phase": phase,
-                "skipped": True,
-                "message": "已跳过机器人传感器检查",
-                "conditions": conditions,
-                "values": {},
-            }
-
-        active_conditions = {
-            name: expected
-            for name, expected in conditions.items()
-            if not self._should_skip_robot_precheck_variable(name)
-        }
-        if not active_conditions:
-            return {
-                "success": True,
-                "phase": phase,
-                "skipped": True,
-                "message": "配置中的传感器均已跳过",
-                "conditions": conditions,
-                "values": {},
-            }
-        if self._plc_gateway is None:
-            raise RuntimeError("机器人任务需要注入 szlab_poly_plc 网关")
-
-        waiter = getattr(self._plc_gateway, "wait_sensor_conditions", None)
-        context = f"机器人{'前置' if phase == 'pre' else '后置'}传感器检查"
-        if callable(waiter):
-            success, values = waiter(
-                active_conditions,
-                interval=self.poll_interval,
-                context=context,
-            )
-        else:
-            success, values = wait_sensor_conditions(
-                self._plc_gateway,
-                active_conditions,
-                interval=self.poll_interval,
-                context=context,
-            )
-        mismatches = {
-            name: {"expected": expected, "actual": values.get(name)}
-            for name, expected in active_conditions.items()
-            if values.get(name) != expected
-        }
-        return {
-            "success": bool(success),
-            "phase": phase,
-            "conditions": active_conditions,
-            "values": values,
-            "mismatches": mismatches,
-        }
-
-    @not_action
-    def _robot_sensor_requirements(
-        self,
-        task: str,
-        station: str,
-        data: dict[str, Any],
-    ) -> tuple[dict[str, bool], dict[str, bool]]:
-        if station == "S01":
-            return {}, {}
-        if station == "S072":
-            return {}, {}
-
-        custom_preconditions = data.get("pre_sensor_conditions")
-        custom_postconditions = data.get("post_sensor_conditions")
-        if custom_preconditions is not None or custom_postconditions is not None:
-            return dict(custom_preconditions or {}), dict(custom_postconditions or {})
-
-        if task == "place":
-            target = str(data.get("target_sensor_variable") or "")
-            if not target:
-                raise RuntimeError(f"{station} 放料动作缺少目标位传感器")
-            return {target: False}, {target: True}
-        if task == "pick":
-            source = str(data.get("source_sensor_variable") or "")
-            if not source:
-                raise RuntimeError(f"{station} 取料动作缺少来源位传感器")
-            return {source: True}, {source: False}
-        return {}, {}
 
     @not_action
     def _slot_number(self, position: str | int) -> int:
@@ -361,17 +355,47 @@ class SzlabMixerRobotDevice(
         task_number: int,
         variables: dict[str, Any] | None = None,
         reset_variables: dict[str, Any] | None = None,
-        precheck=None,
+        verify_reset: bool = False,
+        **data: Any,
+    ) -> dict[str, Any]:
+        with self._robot_task_lock:
+            return self._submit_robot_task_locked(
+                task=task,
+                station=station,
+                task_number=task_number,
+                variables=variables,
+                reset_variables=reset_variables,
+                verify_reset=verify_reset,
+                **data,
+            )
+
+    @not_action
+    def _submit_robot_task_locked(
+        self,
+        task: str,
+        station: str,
+        task_number: int,
+        variables: dict[str, Any] | None = None,
+        reset_variables: dict[str, Any] | None = None,
         verify_reset: bool = False,
         **data: Any,
     ) -> dict[str, Any]:
         reset_variables = reset_variables or {ROBOT_TASK_NUMBER_VARIABLE: 0}
+        method_name = next(
+            (
+                f"submit_{spec.method_name}"
+                for spec in ROBOT_ACTION_SPECS.values()
+                if spec.task_number == int(task_number)
+            ),
+            "",
+        )
         try:
-            pre_sensor_conditions, post_sensor_conditions = self._robot_sensor_requirements(task, station, data)
+            resolved_contract = self._resolved_action_contract(method_name, data)
+            contract_assertion = self._assert_contract_conditions(resolved_contract)
         except Exception as exc:
             result = {
                 "success": False,
-                "message": str(exc),
+                "message": f"机器人动作契约解析或断言失败: {exc}",
                 "task": task,
                 "station": station,
                 "task_number": int(task_number),
@@ -381,40 +405,20 @@ class SzlabMixerRobotDevice(
             self._last_task = result
             return result
 
-        sensor_precheck = None
-        if pre_sensor_conditions:
-            try:
-                sensor_precheck = self._wait_sensor_conditions(pre_sensor_conditions, phase="pre")
-            except Exception as exc:
-                result = {
-                    "success": False,
-                    "message": f"机器人动作前传感器读取失败: {exc}",
-                    "task": task,
-                    "station": station,
-                    "task_number": int(task_number),
-                    "status": "rejected",
-                    **data,
-                }
-                self._last_task = result
-                return result
-            if not sensor_precheck["success"]:
-                result = {
-                    "success": False,
-                    "message": f"{station} {task} 前置传感器状态等待失败",
-                    "task": task,
-                    "station": station,
-                    "task_number": int(task_number),
-                    "status": "rejected",
-                    "sensor_precheck": sensor_precheck,
-                    **data,
-                }
-                self._last_task = result
-                return result
-        elif precheck is not None:
-            precheck_result = precheck()
-            if precheck_result is not None:
-                self._last_task = {**precheck_result, "status": "rejected"}
-                return precheck_result
+        if not contract_assertion["success"]:
+            result = {
+                "success": False,
+                "message": f"{station} {task} 最终安全断言失败",
+                "task": task,
+                "station": station,
+                "task_number": int(task_number),
+                "status": "precondition_failed",
+                "contract_assertion": contract_assertion,
+                "resolved_contract": resolved_contract,
+                **data,
+            }
+            self._last_task = result
+            return result
 
         try:
             handshake_precheck = self._run_robot_handshake_precheck(station)
@@ -501,7 +505,8 @@ class SzlabMixerRobotDevice(
             "completion_value": complete_value,
             "completion_message": complete_message,
             "handshake_precheck": handshake_precheck,
-            "sensor_precheck": sensor_precheck,
+            "contract_assertion": contract_assertion,
+            "resolved_contract": resolved_contract,
             "reset": reset_result,
             **data,
         }
@@ -517,33 +522,37 @@ class SzlabMixerRobotDevice(
                 "message": "机器人任务已完成，但 PC->PLC 变量复位失败",
                 **self._last_task,
             }
-        sensor_postcheck = None
-        if post_sensor_conditions:
-            try:
-                sensor_postcheck = self._wait_sensor_conditions(post_sensor_conditions, phase="post")
-            except Exception as exc:
-                sensor_postcheck = {
-                    "success": False,
-                    "phase": "post",
-                    "message": str(exc),
-                    "conditions": post_sensor_conditions,
-                    "values": {},
-                }
-            self._last_task["sensor_postcheck"] = sensor_postcheck
-            if not sensor_postcheck["success"]:
-                self._last_task["status"] = "verification_failed"
-                return {
-                    "success": False,
-                    "message": "机器人任务已完成，但现场传感器状态验证失败；禁止自动重试",
-                    **self._last_task,
-                }
+        try:
+            effect_verification = self._verify_contract_effects(resolved_contract)
+        except Exception as exc:
+            effect_verification = {
+                "success": False,
+                "values": {},
+                "mismatches": [{"message": str(exc)}],
+            }
+        self._last_task["effect_verification"] = effect_verification
+        if not effect_verification["success"]:
+            self._last_task["status"] = "verification_failed"
+            return {
+                "success": False,
+                "message": "机器人任务已完成，但契约 effect 快速验证失败；禁止自动重试",
+                **self._last_task,
+            }
         return {
             "success": True,
             "message": f"机器人任务已完成: {station} {task}",
             **self._last_task,
         }
 
-    @action(auto_prefix=True, description="S01 取料")
+    @action(
+        auto_prefix=True,
+        description="S01 取料",
+        contract={
+            "opc_conditions": [{"source": "occupancy", "variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S01"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": True}],
+            "effects": [{"source": "occupancy", "variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S01"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": False}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S01"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}}],
+        },
+    )
     def submit_pick_from_s01(
         self,
         product_type: int = 1,
@@ -554,35 +563,80 @@ class SzlabMixerRobotDevice(
         except Exception as exc:
             return {"success": False, "message": str(exc), "task": "pick", "station": "S01", "position": position}
 
-    @action(auto_prefix=True, description="S02 放 TIP")
+    @action(
+        auto_prefix=True,
+        description="S02 放 TIP",
+        contract={
+            "opc_conditions": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S02"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": False}],
+            "effects": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S02"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": True}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S02"}, "position": {"kind": "parameter", "parameter": "position"}}}}],
+        },
+    )
     def submit_place_to_s02(self, position: int = 1) -> dict[str, Any]:
         try:
             return self._run_s02_place(position)
         except Exception as exc:
             return {"success": False, "message": str(exc), "task": "place", "station": "S02", "position": position}
 
-    @action(auto_prefix=True, description="S02 取 TIP")
+    @action(
+        auto_prefix=True,
+        description="S02 取 TIP",
+        contract={
+            "opc_conditions": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S02"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": True}],
+            "effects": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S02"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": False}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S02"}, "position": {"kind": "parameter", "parameter": "position"}}}}],
+        },
+    )
     def submit_pick_from_s02(self, position: int = 1) -> dict[str, Any]:
         try:
             return self._run_s02_pick(position)
         except Exception as exc:
             return {"success": False, "message": str(exc), "task": "pick", "station": "S02", "position": position}
 
-    @action(auto_prefix=True, description="S03 放容器")
+    @action(
+        auto_prefix=True,
+        description="S03 放容器",
+        contract={
+            "opc_conditions": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S03"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": False}],
+            "effects": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S03"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": True}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S03"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}}],
+        },
+    )
     def submit_place_to_s03(self, product_type: int = 1, position: str = "1-1") -> dict[str, Any]:
         try:
             return self._run_s03_place(product_type, position)
         except Exception as exc:
             return {"success": False, "message": str(exc), "task": "place", "station": "S03", "position": position}
 
-    @action(auto_prefix=True, description="S03 取容器")
+    @action(
+        auto_prefix=True,
+        description="S03 取容器",
+        contract={
+            "opc_conditions": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S03"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": True}],
+            "effects": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S03"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": False}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S03"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}}],
+        },
+    )
     def submit_pick_from_s03(self, product_type: int = 1, position: str = "1-1") -> dict[str, Any]:
         try:
             return self._run_s03_pick(product_type, position)
         except Exception as exc:
             return {"success": False, "message": str(exc), "task": "pick", "station": "S03", "position": position}
 
-    @action(auto_prefix=True, description="S04 放料")
+    @action(
+        auto_prefix=True,
+        description="S04 放料",
+        contract={
+            "opc_conditions": [
+                {"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {
+                    "kind": "constant", "value": "S04"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": False},
+                {"variable": {"kind": "resolver", "resolver_id": "szlab.s12.station_ready_variable", "arguments": {"station": {
+                    "kind": "constant", "value": "S04"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": True},
+            ],
+            "effects": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S04"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": True}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S04"}, "position": {"kind": "parameter", "parameter": "position"}}}}],
+        },
+    )
     def submit_place_to_s04(self, position: int = 1, sample_id: str = "") -> dict[str, Any]:
         try:
             return self._run_s04_place(position=position, sample_id=sample_id)
@@ -596,14 +650,35 @@ class SzlabMixerRobotDevice(
                 "sample_id": sample_id,
             }
 
-    @action(auto_prefix=True, description="S04 取料")
+    @action(
+        auto_prefix=True,
+        description="S04 取料",
+        contract={
+            "opc_conditions": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S04"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": True}],
+            "effects": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S04"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": False}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S04"}, "position": {"kind": "parameter", "parameter": "position"}}}}],
+        },
+    )
     def submit_pick_from_s04(self, position: int = 1) -> dict[str, Any]:
         try:
             return self._run_s04_pick(position=position)
         except Exception as exc:
             return {"success": False, "message": str(exc), "task": "pick", "station": "S04", "position": position}
 
-    @action(auto_prefix=True, description="S05 放料")
+    @action(
+        auto_prefix=True,
+        description="S05 放料",
+        contract={
+            "opc_conditions": [
+                {"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable",
+                              "arguments": {"station": {"kind": "constant", "value": "S05"}}}, "expected": False},
+                {"variable": {"kind": "resolver", "resolver_id": "szlab.s12.station_ready_variable",
+                              "arguments": {"station": {"kind": "constant", "value": "S05"}}}, "expected": True},
+            ],
+            "effects": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S05"}}}, "expected": True}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S05"}}}}],
+        },
+    )
     def submit_place_to_s05(self, sample_id: str = "") -> dict[str, Any]:
         try:
             return self._run_s05_place(sample_id=sample_id)
@@ -616,42 +691,105 @@ class SzlabMixerRobotDevice(
                 "sample_id": sample_id,
             }
 
-    @action(auto_prefix=True, description="S05 取料")
+    @action(
+        auto_prefix=True,
+        description="S05 取料",
+        contract={
+            "opc_conditions": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S05"}}}, "expected": True}],
+            "effects": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S05"}}}, "expected": False}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S05"}}}}],
+        },
+    )
     def submit_pick_from_s05(self, sample_id: str = "") -> dict[str, Any]:
         try:
             return self._run_s05_pick(sample_id=sample_id)
         except Exception as exc:
             return {"success": False, "message": str(exc), "task": "pick", "station": "S05", "sample_id": sample_id}
 
-    @action(auto_prefix=True, description="S06 放料")
+    @action(
+        auto_prefix=True,
+        description="S06 放料",
+        contract={
+            "opc_conditions": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S06"}}}, "expected": False}],
+            "effects": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S06"}}}, "expected": True}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S06"}}}}],
+        },
+    )
     def submit_place_to_s06(self) -> dict[str, Any]:
         try:
             return self._run_s06_place()
         except Exception as exc:
             return {"success": False, "message": str(exc), "task": "place", "station": "S06"}
 
-    @action(auto_prefix=True, description="S06 取料")
+    @action(
+        auto_prefix=True,
+        description="S06 取料",
+        contract={
+            "opc_conditions": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S06"}}}, "expected": True}],
+            "effects": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S06"}}}, "expected": False}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S06"}}}}],
+        },
+    )
     def submit_pick_from_s06(self) -> dict[str, Any]:
         try:
             return self._run_s06_pick()
         except Exception as exc:
             return {"success": False, "message": str(exc), "task": "pick", "station": "S06"}
 
-    @action(auto_prefix=True, description="S071 放粉罐")
-    def submit_place_to_s071(self, position: str = "1-1") -> dict[str, Any]:
+    @action(
+        auto_prefix=True,
+        description="S071 放粉罐",
+        contract={
+            "opc_conditions": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S071"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": False}],
+            "effects": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S071"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": True}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S071"}, "position": {"kind": "parameter", "parameter": "position"}}}}],
+        },
+    )
+    def submit_place_to_s071(
+        self,
+        position: Literal["1-1", "1-2", "1-3", "2-1", "2-2", "2-3"] = "1-1",
+    ) -> dict[str, Any]:
         try:
             return self._run_s071_place(position)
         except Exception as exc:
-            return {"success": False, "message": str(exc), "task": "place", "station": "S071", "position": position}
+            return {
+                "success": False,
+                "message": str(exc),
+                "status": "invalid_arguments",
+                "task": "place",
+                "station": "S071",
+                "position": position,
+            }
 
-    @action(auto_prefix=True, description="S071 取粉罐")
+    @action(
+        auto_prefix=True,
+        description="S071 取粉罐",
+        contract={
+            "opc_conditions": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S071"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": True}],
+            "effects": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S071"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": False}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S071"}, "position": {"kind": "parameter", "parameter": "position"}}}}],
+        },
+    )
     def submit_pick_from_s071(self, position: str = "1-1") -> dict[str, Any]:
         try:
             return self._run_s071_pick(position)
         except Exception as exc:
             return {"success": False, "message": str(exc), "task": "pick", "station": "S071", "position": position}
 
-    @action(auto_prefix=True, description="并行执行 S071 取粉罐与 S07 旋转到上料位")
+    @action(
+        auto_prefix=True,
+        description="并行执行 S071 取粉罐与 S07 旋转到上料位",
+        contract={
+            "opc_conditions": [
+                {"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {
+                    "kind": "constant", "value": "S071"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": True},
+                {"variable": "S07原点信号", "expected": True},
+                {"variable": "S07允许加工", "expected": True},
+            ],
+            "effects": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S071"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": False}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": "device:szlab_s07_solid_addition"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S071"}, "position": {"kind": "parameter", "parameter": "position"}}}}],
+        },
+    )
     def submit_pick_from_s071_and_rotate_to_feed(
         self,
         position: str = "1-1",
@@ -668,21 +806,45 @@ class SzlabMixerRobotDevice(
                 "load_position": load_position,
             }
 
-    @action(auto_prefix=True, description="S072 放料")
-    def submit_place_to_s072(self, product_type: int = 1, position: int = 1) -> dict[str, Any]:
+    @action(
+        auto_prefix=True,
+        description="S072 放料",
+        contract={
+            "opc_conditions": [{"source": "occupancy", "variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S072"}, "product_type": {"kind": "parameter", "parameter": "product_type"}}}, "expected": False}],
+            "effects": [{"source": "occupancy", "variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S072"}, "product_type": {"kind": "parameter", "parameter": "product_type"}}}, "expected": True}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S072"}, "product_type": {"kind": "parameter", "parameter": "product_type"}}}}],
+        },
+    )
+    def submit_place_to_s072(self, product_type: int = 1) -> dict[str, Any]:
         try:
-            return self._run_s072_place(product_type, position)
+            return self._run_s072_place(product_type)
         except Exception as exc:
-            return {"success": False, "message": str(exc), "task": "place", "station": "S072", "position": position}
+            return {"success": False, "message": str(exc), "task": "place", "station": "S072"}
 
-    @action(auto_prefix=True, description="S072 取料")
-    def submit_pick_from_s072(self, product_type: int = 1, position: int = 1) -> dict[str, Any]:
+    @action(
+        auto_prefix=True,
+        description="S072 取料",
+        contract={
+            "opc_conditions": [{"source": "occupancy", "variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S072"}, "product_type": {"kind": "parameter", "parameter": "product_type"}}}, "expected": True}],
+            "effects": [{"source": "occupancy", "variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S072"}, "product_type": {"kind": "parameter", "parameter": "product_type"}}}, "expected": False}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S072"}, "product_type": {"kind": "parameter", "parameter": "product_type"}}}}],
+        },
+    )
+    def submit_pick_from_s072(self, product_type: int = 1) -> dict[str, Any]:
         try:
-            return self._run_s072_pick(product_type, position)
+            return self._run_s072_pick(product_type)
         except Exception as exc:
-            return {"success": False, "message": str(exc), "task": "pick", "station": "S072", "position": position}
+            return {"success": False, "message": str(exc), "task": "pick", "station": "S072"}
 
-    @action(auto_prefix=True, description="S08 放瓶")
+    @action(
+        auto_prefix=True,
+        description="S08 放瓶",
+        contract={
+            "opc_conditions": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S08"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": False}],
+            "effects": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S08"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": True}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S08"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}}],
+        },
+    )
     def submit_place_to_s08(
         self,
         product_type: int = 1,
@@ -693,7 +855,15 @@ class SzlabMixerRobotDevice(
         except Exception as exc:
             return {"success": False, "message": str(exc), "task": "place", "station": "S08", "position": position}
 
-    @action(auto_prefix=True, description="S08 取瓶")
+    @action(
+        auto_prefix=True,
+        description="S08 取瓶",
+        contract={
+            "opc_conditions": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S08"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": True}],
+            "effects": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S08"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": False}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S08"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}}],
+        },
+    )
     def submit_pick_from_s08(
         self,
         product_type: int = 1,
@@ -704,7 +874,15 @@ class SzlabMixerRobotDevice(
         except Exception as exc:
             return {"success": False, "message": str(exc), "task": "pick", "station": "S08", "position": position}
 
-    @action(auto_prefix=True, description="S08 倒料")
+    @action(
+        auto_prefix=True,
+        description="S08 倒料",
+        contract={
+            "opc_conditions": [{"variable": "传感器状态_上位机[3].NO[14]", "expected": True}],
+            "effects": [{"variable": "传感器状态_上位机[3].NO[14]", "expected": True}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": "slot:szlab_mixer_robot:S08:pour:1"}],
+        },
+    )
     def submit_pour_from_s08(self, product_type: int = 1) -> dict[str, Any]:
         try:
             return self._run_s08_pour(product_type)
@@ -714,6 +892,11 @@ class SzlabMixerRobotDevice(
     @action(
         auto_prefix=True,
         description="S09 放料",
+        contract={
+            "opc_conditions": [{"source": "occupancy", "variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S09"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": False}],
+            "effects": [{"source": "occupancy", "variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S09"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": True}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S09"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}}],
+        },
         handles=[
             ActionInputHandle(
                 key="product_type",
@@ -742,6 +925,11 @@ class SzlabMixerRobotDevice(
     @action(
         auto_prefix=True,
         description="S09 取料",
+        contract={
+            "opc_conditions": [{"source": "occupancy", "variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S09"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": True}],
+            "effects": [{"source": "occupancy", "variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S09"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": False}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S09"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}}],
+        },
         handles=[
             ActionInputHandle(
                 key="product_type",
@@ -767,28 +955,60 @@ class SzlabMixerRobotDevice(
         except Exception as exc:
             return {"success": False, "message": str(exc), "task": "pick", "station": "S09", "position": position}
 
-    @action(auto_prefix=True, description="S10 放试剂瓶")
+    @action(
+        auto_prefix=True,
+        description="S10 放试剂瓶",
+        contract={
+            "opc_conditions": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S10"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": False}],
+            "effects": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S10"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": True}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S10"}, "position": {"kind": "parameter", "parameter": "position"}}}}],
+        },
+    )
     def submit_place_to_s10(self, position: int = 1) -> dict[str, Any]:
         try:
             return self._run_s10_place(position)
         except Exception as exc:
             return {"success": False, "message": str(exc), "task": "place", "station": "S10", "position": position}
 
-    @action(auto_prefix=True, description="S10 取试剂瓶")
+    @action(
+        auto_prefix=True,
+        description="S10 取试剂瓶",
+        contract={
+            "opc_conditions": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S10"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": True}],
+            "effects": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S10"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": False}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S10"}, "position": {"kind": "parameter", "parameter": "position"}}}}],
+        },
+    )
     def submit_pick_from_s10(self, position: int = 1) -> dict[str, Any]:
         try:
             return self._run_s10_pick(position)
         except Exception as exc:
             return {"success": False, "message": str(exc), "task": "pick", "station": "S10", "position": position}
 
-    @action(auto_prefix=True, description="S11 放成品")
+    @action(
+        auto_prefix=True,
+        description="S11 放成品",
+        contract={
+            "opc_conditions": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S11"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": False}],
+            "effects": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S11"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": True}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S11"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}}],
+        },
+    )
     def submit_place_to_s11(self, product_type: int = 1, position: str = "1-1") -> dict[str, Any]:
         try:
             return self._run_s11_place(product_type, position)
         except Exception as exc:
             return {"success": False, "message": str(exc), "task": "place", "station": "S11", "position": position}
 
-    @action(auto_prefix=True, description="S11 取成品")
+    @action(
+        auto_prefix=True,
+        description="S11 取成品",
+        contract={
+            "opc_conditions": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S11"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": True}],
+            "effects": [{"variable": {"kind": "resolver", "resolver_id": "szlab.s12.slot_variable", "arguments": {"station": {"kind": "constant", "value": "S11"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}, "expected": False}],
+            "physical_resources": [{"resource_id": "device:szlab_mixer_robot"}, {"resource_id": {"kind": "resolver", "resolver_id": "szlab.s12.slot_resource", "arguments": {"station": {"kind": "constant", "value": "S11"}, "product_type": {"kind": "parameter", "parameter": "product_type"}, "position": {"kind": "parameter", "parameter": "position"}}}}],
+        },
+    )
     def submit_pick_from_s11(self, product_type: int = 1, position: str = "1-1") -> dict[str, Any]:
         try:
             return self._run_s11_pick(product_type, position)

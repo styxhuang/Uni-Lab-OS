@@ -5,7 +5,6 @@ from task_orchestration.models import (
     OpcSnapshotRequest,
     TaskInstance,
     Template,
-    Trigger,
     VersionedWorkspaceResponse,
     Workspace,
     WorkflowPathQuery,
@@ -14,21 +13,48 @@ from pydantic import ValidationError
 import pytest
 
 
+def _empty_contract(node_id: str) -> dict:
+    return {
+        "node_id": node_id,
+        "contract_state": "empty",
+        "preconditions": [],
+        "effects": [],
+        "resources": [],
+    }
+
+
 def test_models_serialize_task_workspace_contract():
-    trigger = Trigger(
-        kind="opc",
-        config={
-            "plc_device_id": "szlab_poly_plc",
-            "variable": "s09",
-            "value": True,
-        },
-    )
     template = Template(
+        schema_version=2,
         id="template-1",
         name="Prepare sample",
         workflow_path="demo.json",
         node_ids=["node-1"],
-        input_triggers=[trigger],
+        node_contracts=[
+            {
+                "node_id": "node-1",
+                "contract_state": "resolved",
+                "preconditions": [
+                    {
+                        "source": "opc",
+                        "variable": "s09",
+                        "operator": "eq",
+                        "expected": True,
+                    }
+                ],
+                "effects": [],
+                "resources": ["device:robot"],
+            }
+        ],
+        admission_gates=[
+            {
+                "source": "opc",
+                "variable": "s09",
+                "operator": "eq",
+                "expected": True,
+            }
+        ],
+        resource_requirements=["device:robot"],
     )
     task = TaskInstance(
         id="task-1",
@@ -44,22 +70,25 @@ def test_models_serialize_task_workspace_contract():
         ),
     )
 
-    assert response.model_dump()["workspace"]["templates"][0]["input_triggers"][0]["kind"] == "opc"
+    assert (
+        response.model_dump()["workspace"]["templates"][0]["admission_gates"][0][
+            "variable"
+        ]
+        == "s09"
+    )
     assert response.model_dump()["workspace"]["task_instances"][0]["status"] == "pending"
 
 
-def test_template_accepts_empty_triggers_and_preserves_legacy_resources():
-    template = Template(
-        id="template-empty",
-        name="No PLC gates",
-        resources=["legacy-robot"],
-        input_triggers=[],
-        output_triggers=[],
-    )
-
-    assert template.input_triggers == []
-    assert template.output_triggers == []
-    assert template.resources == ["legacy-robot"]
+def test_template_rejects_legacy_trigger_and_resource_fields():
+    with pytest.raises(ValidationError):
+        Template(
+            schema_version=2,
+            id="template-empty",
+            name="No PLC gates",
+            resources=["legacy-robot"],
+            input_triggers=[],
+            output_triggers=[],
+        )
 
 
 def test_action_resource_compatibility_fields_accept_ignored_contents():
@@ -92,6 +121,25 @@ def test_models_reject_legacy_fields_outside_store_load_migration():
             "trigger": {"kind": "legacy", "value": True},
         })
 
+
+def test_template_serializes_compiler_supplied_empty_contract_nodes():
+    template = Template(
+        id="empty-contract",
+        name="Empty contract",
+        node_ids=["plain"],
+        node_contracts=[_empty_contract("plain")],
+    )
+
+    assert template.model_dump()["node_contracts"] == [
+        {
+            "node_id": "plain",
+            "contract_state": "empty",
+            "preconditions": [],
+            "effects": [],
+            "resources": [],
+        }
+    ]
+
     with pytest.raises(
         ValidationError,
         match="completed instance execution must be finished",
@@ -99,9 +147,17 @@ def test_models_reject_legacy_fields_outside_store_load_migration():
         Workspace.model_validate({
             "workflow_path": "demo.json",
             "templates": [{
+                "schema_version": 2,
                 "id": "legacy-template",
                 "name": "Legacy",
                 "node_ids": ["node-1"],
+                "node_contracts": [{
+                    "node_id": "node-1",
+                    "contract_state": "empty",
+                    "preconditions": [],
+                    "effects": [],
+                    "resources": [],
+                }],
             }],
             "task_instances": [{
                 "id": "legacy-completed",
@@ -113,19 +169,19 @@ def test_models_reject_legacy_fields_outside_store_load_migration():
         })
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {"kind": "resource", "config": {"resource": "s09"}},
-        {"kind": "workstation", "config": {"workstation": "s09"}},
-        {"kind": "internal", "config": {"key": "next", "value": True}},
-        {"kind": "opc", "config": {"provider_id": "default", "variable": "s09", "value": True}},
-        {"kind": "opc", "config": {"plc_device_id": "szlab_poly_plc", "variable": "s09"}},
-    ],
-)
-def test_trigger_rejects_legacy_or_incomplete_condition(payload):
+@pytest.mark.parametrize("missing_field", ["preconditions", "effects", "resources"])
+def test_node_contract_requires_all_persisted_list_fields(missing_field):
+    payload = {
+        "node_id": "node",
+        "contract_state": "empty",
+        "preconditions": [],
+        "effects": [],
+        "resources": [],
+    }
+    payload.pop(missing_field)
+
     with pytest.raises(ValidationError):
-        Trigger.model_validate(payload)
+        models.NodeContract.model_validate(payload)
 
 
 def test_query_and_opc_snapshot_dtos_reserve_expected_fields():
@@ -244,11 +300,13 @@ def test_non_running_task_instance_rejects_active_execution(
         (
             [
                 Template(
+                    schema_version=2,
                     id="template-1",
                     name="first",
                     workflow_path="demo.json",
                 ),
                 Template(
+                    schema_version=2,
                     id="template-1",
                     name="second",
                     workflow_path="demo.json",
@@ -548,10 +606,20 @@ def test_task_instance_and_workspace_persist_explicit_runtime_state():
         workflow_path="demo.json",
         templates=[
             Template(
+                schema_version=2,
                 id="template-1",
                 name="Prepare sample",
                 workflow_path="demo.json",
                 node_ids=["node-1"],
+                node_contracts=[
+                    {
+                        "node_id": "node-1",
+                        "contract_state": "empty",
+                        "preconditions": [],
+                        "effects": [],
+                        "resources": [],
+                    }
+                ],
             )
         ],
         task_instances=[task],
@@ -581,16 +649,19 @@ def test_task_instance_and_workspace_persist_explicit_runtime_state():
     assert dumped["pause_reason"]["code"] == "robot_unavailable"
 
 
-def test_legacy_sidecar_defaults_new_runtime_state_fields():
+def test_current_schema_defaults_runtime_state_fields():
     workspace = Workspace.model_validate(
         {
             "workflow_path": "demo.json",
             "scheduler_paused": True,
             "templates": [
                 {
+                    "schema_version": 2,
                     "id": "template-1",
                     "name": "Prepare sample",
                     "workflow_path": "demo.json",
+                    "node_ids": [],
+                    "node_contracts": [],
                 }
             ],
             "task_instances": [
@@ -674,10 +745,15 @@ def _runtime_workspace_payload():
         "workflow_path": "demo.json",
         "templates": [
             {
+                "schema_version": 2,
                 "id": "template-1",
                 "name": "Prepare sample",
                 "workflow_path": "demo.json",
                 "node_ids": ["node-1", "node-2"],
+                "node_contracts": [
+                    _empty_contract("node-1"),
+                    _empty_contract("node-2"),
+                ],
             }
         ],
         "task_instances": [

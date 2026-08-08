@@ -37,7 +37,6 @@ class SzlabRobotS08Mixin:
             task_number=17,
             variables=build_variables("place_to_s08", S08取放料产品=product_type, S08取放料编号=position),
             reset_variables={"S08取放料产品": 0, "S08取放料编号": 0, "任务号": 0},
-            precheck=lambda: self._ensure_sensor_gate(sensor, False, "S08 放料目标位必须为空"),
             product_type=int(product_type),
             position=int(position),
             target_sensor_variable=sensor,
@@ -51,7 +50,6 @@ class SzlabRobotS08Mixin:
             task_number=18,
             variables=build_variables("pick_from_s08", S08取放料产品=product_type, S08取放料编号=position),
             reset_variables={"S08取放料产品": 0, "S08取放料编号": 0, "任务号": 0},
-            precheck=lambda: self._ensure_sensor_gate(sensor, True, "S08 取料源位必须有物料"),
             product_type=int(product_type),
             position=int(position),
             source_sensor_variable=sensor,
@@ -66,7 +64,4 @@ class SzlabRobotS08Mixin:
             variables=build_variables("pour_from_s08", S08倒料产品选择=product_type),
             reset_variables={"S08倒料产品选择": 0, "任务号": 0},
             product_type=product_type,
-            pre_sensor_conditions={
-                S08_POUR_SAMPLE_VIAL_SENSOR: True,
-            },
         )

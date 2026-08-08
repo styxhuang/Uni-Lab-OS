@@ -16,7 +16,6 @@ class SzlabRobotS05Mixin:
             task_number=S05_PICK_TASK_NUMBER,
             variables=None,
             reset_variables={"任务号": 0},
-            precheck=lambda: self._ensure_sensor_gate(S05_MATERIAL_SENSOR, True, "S05 取料源位必须有物料"),
             sample_id=sample_id,
             source_sensor_variable=S05_MATERIAL_SENSOR,
         )

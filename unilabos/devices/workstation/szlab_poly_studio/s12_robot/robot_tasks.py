@@ -15,6 +15,11 @@ from unilabos.devices.workstation.szlab_poly_studio.sensor import (
     S10Sensors,
     S11Sensors,
 )
+from unilabos.devices.workstation.szlab_poly_studio.sensor import S08Sensors
+from unilabos.devices.workstation.szlab_poly_studio.s04_magnetic_stirring.sensors import (
+    s04_ready_var,
+)
+from unilabos.registry.action_contract import register_contract_resolver
 
 GateKind = Literal["pick", "place", "pour"]
 
@@ -193,3 +198,74 @@ def powder_container_sensor(position: str | int) -> str:
 def build_variables(spec_name: str, **kwargs: Any) -> dict[str, Any]:
     spec = ROBOT_ACTION_SPECS[spec_name]
     return {name: int(kwargs[name]) for name in spec.variables}
+
+
+def robot_slot_variable(
+    station: str,
+    product_type: int = 1,
+    position: str | int = 1,
+) -> str:
+    """将机器人逻辑槽位解析为实体传感器或正式软件占用变量。"""
+    station = str(station)
+    if station == "S072":
+        return f"occupancy:szlab_mixer_robot:S072:lane:{int(product_type)}"
+    if station in {"S01", "S09"}:
+        return f"occupancy:szlab_mixer_robot:{station}:{int(product_type)}:{position}"
+    if station == "S02":
+        return s02_sensor(int(position))
+    if station == "S03":
+        return product_slot_sensor(product_type, position, used=False)
+    if station == "S04":
+        return s04_sensor(int(position))
+    if station == "S05":
+        return S05_MATERIAL_SENSOR
+    if station == "S06":
+        return S06_MATERIAL_SENSOR
+    if station == "S071":
+        return powder_container_sensor(position)
+    if station == "S08":
+        position_number = numbered_position(
+            int(position),
+            min_value=1,
+            max_value=2,
+            label="S08 取放瓶位置",
+        )
+        return S08Sensors.CAP_STATION[position_number]
+    if station == "S10":
+        return s10_sensor(int(position))
+    if station == "S11":
+        return product_slot_sensor(product_type, position, used=True)
+    raise ValueError(f"未知机器人槽位工位: {station}")
+
+
+def robot_slot_resource(
+    station: str,
+    product_type: int = 1,
+    position: str | int = 1,
+) -> str:
+    """解析可供调度器互斥的具体机器人物理槽位 ID。"""
+    robot_slot_variable(station, product_type, position)
+    if station == "S072":
+        return f"slot:szlab_mixer_robot:S072:lane:{int(product_type)}"
+    return f"slot:szlab_mixer_robot:{station}:{int(product_type)}:{position}"
+
+
+def robot_station_ready_variable(station: str, position: int = 1) -> str:
+    """解析放料动作已有的工位就绪门控变量。"""
+    if station == "S04":
+        return s04_ready_var(int(position))
+    if station == "S05":
+        from unilabos.devices.workstation.szlab_poly_studio.s05_photoshotting.sensors import (
+            S05_READY,
+        )
+
+        return S05_READY
+    raise ValueError(f"工位没有声明式就绪变量: {station}")
+
+
+register_contract_resolver("szlab.s12.slot_variable", robot_slot_variable)
+register_contract_resolver("szlab.s12.slot_resource", robot_slot_resource)
+register_contract_resolver(
+    "szlab.s12.station_ready_variable",
+    robot_station_ready_variable,
+)

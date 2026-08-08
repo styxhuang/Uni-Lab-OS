@@ -26,6 +26,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from unilabos.registry.ast_types import (
+    ASTCall,
+    from_cache_wire,
+    to_cache_wire,
+)
+from unilabos.registry.decorators import normalize_action_contract
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -33,7 +40,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 MAX_SCAN_DEPTH = 10      # 最大目录递归深度
 MAX_SCAN_FILES = 1000    # 最大扫描文件数量
-_CACHE_VERSION = 3       # 缓存格式版本号，格式变更时递增
+_CACHE_VERSION = 6       # 缓存格式版本号，格式变更时递增
+_CACHE_WIRE_VERSION = 1
 _DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 # 合法的装饰器来源模块
@@ -62,30 +70,44 @@ def _file_fingerprint(filepath: Path) -> Dict[str, Any]:
 
 
 def load_scan_cache(cache_path: Optional[Path]) -> Dict[str, Any]:
-    """Load the AST scan cache from *cache_path*. Returns empty structure on any error."""
+    """从 JSON wire 缓存恢复 AST 扫描结果。"""
     if cache_path is None or not cache_path.is_file():
         return {"version": _CACHE_VERSION, "files": {}}
-    try:
-        raw = cache_path.read_text(encoding="utf-8")
-        data = json.loads(raw)
-        if data.get("version") != _CACHE_VERSION:
-            return {"version": _CACHE_VERSION, "files": {}}
-        return data
-    except Exception:
+    raw = cache_path.read_text(encoding="utf-8")
+    wire = json.loads(raw)
+    if (
+        not isinstance(wire, dict)
+        or wire.get("wire_version") != _CACHE_WIRE_VERSION
+    ):
         return {"version": _CACHE_VERSION, "files": {}}
+    try:
+        data = from_cache_wire(wire.get("payload"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"AST 扫描缓存反序列化失败: {exc}") from exc
+    if not isinstance(data, dict) or data.get("version") != _CACHE_VERSION:
+        return {"version": _CACHE_VERSION, "files": {}}
+    return data
 
 
 def save_scan_cache(cache_path: Optional[Path], cache: Dict[str, Any]) -> None:
-    """Persist *cache* to *cache_path* (atomic-ish via temp file)."""
+    """使用明确 wire 格式原子写入 AST 扫描缓存。"""
     if cache_path is None:
         return
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    wire = {
+        "wire_version": _CACHE_WIRE_VERSION,
+        "payload": to_cache_wire(cache),
+    }
+    tmp = cache_path.with_suffix(".tmp")
     try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.write_text(
+            json.dumps(wire, ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
         tmp.replace(cache_path)
     except Exception:
-        pass
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _is_cache_hit(entry: Dict[str, Any], fp: Dict[str, Any]) -> bool:
@@ -151,6 +173,7 @@ def scan_directory(
     exclude_files: Optional[set] = None,
     cache: Optional[Dict[str, Any]] = None,
     include_files: Optional[List[Union[str, Path]]] = None,
+    raise_on_error: bool = True,
 ) -> Dict[str, Any]:
     """
     Recursively scan .py files under *root_dir* for @device and @resource
@@ -177,6 +200,7 @@ def scan_directory(
         cache: Mutable cache dict (``load_scan_cache()`` result). Hits are read
                from here; misses are written back so the caller can persist later.
         include_files: 指定扫描的文件列表，提供时跳过目录递归收集，直接扫描这些文件。
+        raise_on_error: 遇到语法或契约错误时是否立即失败；False 时写入 ``_errors``。
     """
     if executor is None:
         raise ValueError("executor is required and must not be None")
@@ -200,23 +224,37 @@ def scan_directory(
     resources: Dict[str, dict] = {}
     cache_hits = 0
     cache_misses = 0
+    scan_errors: List[str] = []
 
-    def _parse_one_cached(py_file: Path) -> Tuple[List[dict], List[dict], bool]:
-        """Returns (devices, resources, was_cache_hit)."""
+    def _parse_one_cached(
+        py_file: Path,
+    ) -> Tuple[List[dict], List[dict], bool, Optional[str]]:
+        """返回设备、资源、缓存命中状态和可见错误。"""
         key = str(py_file)
         try:
             fp = _file_fingerprint(py_file)
-        except OSError:
-            return [], [], False
+        except OSError as exc:
+            error = f"AST 扫描失败 {py_file}: {exc}"
+            if raise_on_error:
+                raise ValueError(error) from exc
+            return [], [], False, error
 
         cached_entry = cache_files.get(key)
         if cached_entry and _is_cache_hit(cached_entry, fp):
-            return cached_entry.get("devices", []), cached_entry.get("resources", []), True
+            return (
+                cached_entry.get("devices", []),
+                cached_entry.get("resources", []),
+                True,
+                None,
+            )
 
         try:
             devs, ress = _parse_file(py_file, python_path)
-        except (SyntaxError, Exception):
-            devs, ress = [], []
+        except Exception as exc:
+            error = f"AST 扫描失败 {py_file}: {exc}"
+            if raise_on_error:
+                raise ValueError(error) from exc
+            return [], [], False, error
 
         cache_files[key] = {
             "md5": fp["md5"],
@@ -225,12 +263,14 @@ def scan_directory(
             "devices": devs,
             "resources": ress,
         }
-        return devs, ress, False
+        return devs, ress, False, None
 
     def _collect_results(futures_dict: Dict):
         nonlocal cache_hits, cache_misses
         for future in as_completed(futures_dict):
-            devs, ress, hit = future.result()
+            devs, ress, hit, error = future.result()
+            if error:
+                scan_errors.append(error)
             if hit:
                 cache_hits += 1
             else:
@@ -265,6 +305,7 @@ def scan_directory(
     return {
         "devices": devices,
         "resources": resources,
+        "_errors": sorted(scan_errors),
         "_cache_stats": {"hits": cache_hits, "misses": cache_misses, "total": len(py_files)},
     }
 
@@ -554,6 +595,30 @@ def _find_method_decorator(func_node: ast.FunctionDef, decorator_name: str) -> O
     return None
 
 
+def _find_registry_method_decorator(
+    func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+    decorator_name: str,
+    import_map: Dict[str, str],
+) -> Optional[Union[ast.Call, ast.Name]]:
+    """按 import_map 查找 registry 方法装饰器，支持安全别名。"""
+    expected_target = f"{_REGISTRY_DECORATOR_MODULE}.{decorator_name}"
+    for decorator_node in func_node.decorator_list:
+        target = (
+            decorator_node.func
+            if isinstance(decorator_node, ast.Call)
+            else decorator_node
+        )
+        if isinstance(target, ast.Name):
+            resolved_target = import_map.get(target.id, "")
+        elif isinstance(target, ast.Attribute):
+            resolved_target = _resolve_attribute(target, import_map)
+        else:
+            continue
+        if resolved_target.replace(":", ".") == expected_target:
+            return decorator_node
+    return None
+
+
 def _has_decorator(func_node: ast.FunctionDef, decorator_name: str) -> bool:
     """Check if a method has a specific decorator (with or without call)."""
     for dec in func_node.decorator_list:
@@ -570,7 +635,7 @@ def _has_decorator(func_node: ast.FunctionDef, decorator_name: str) -> bool:
 def _is_registry_decorator(name: str, import_map: Dict[str, str]) -> bool:
     """Check that *name* was imported from ``unilabos.registry.decorators``."""
     source = import_map.get(name, "")
-    return _REGISTRY_DECORATOR_MODULE in source
+    return source.replace(":", ".") == f"{_REGISTRY_DECORATOR_MODULE}.{name}"
 
 
 def _extract_decorator_args(
@@ -596,6 +661,86 @@ def _extract_decorator_args(
         result[kw.arg] = _ast_node_to_value(kw.value, import_map)
 
     return result
+
+
+_ACTION_CONTRACT_CONSTRUCTORS = frozenset(
+    {
+        "ActionContract",
+        "ActionEffect",
+        "ConstantBinding",
+        "OPCCondition",
+        "ParameterBinding",
+        "ParameterResolver",
+        "PhysicalResource",
+    }
+)
+
+
+def _validate_action_contract_ast(
+    node: Union[ast.Call, ast.Name],
+    import_map: Dict[str, str],
+) -> None:
+    """确保 contract 仅包含声明式构造器和 JSON 字面量。"""
+    if not isinstance(node, ast.Call):
+        return
+
+    contract_node = next(
+        (kw.value for kw in node.keywords if kw.arg == "contract"),
+        None,
+    )
+    if contract_node is None:
+        return
+
+    def _validate(value: ast.expr) -> None:
+        if isinstance(value, ast.Constant):
+            return
+        if isinstance(value, ast.List):
+            for item in value.elts:
+                _validate(item)
+            return
+        if isinstance(value, (ast.Tuple, ast.Set)):
+            raise ValueError("Action contract 只允许标准 JSON 字面量")
+        if isinstance(value, ast.Dict):
+            for key, item in zip(value.keys, value.values):
+                if key is not None:
+                    _validate(key)
+                _validate(item)
+            return
+        if isinstance(value, ast.UnaryOp) and isinstance(value.op, (ast.USub, ast.UAdd)):
+            _validate(value.operand)
+            return
+        if isinstance(value, ast.Call):
+            if isinstance(value.func, ast.Name):
+                local_name = value.func.id
+                resolved_name = import_map.get(local_name, local_name)
+                call_name = resolved_name.replace(":", ".").rsplit(".", 1)[-1]
+            elif isinstance(value.func, ast.Attribute):
+                resolved_name = _resolve_attribute(value.func, import_map)
+                call_name = resolved_name.replace(":", ".").rsplit(".", 1)[-1]
+            else:
+                resolved_name = ""
+                call_name = ""
+            normalized_target = resolved_name.replace(":", ".")
+            target_module = (
+                normalized_target.rsplit(".", 1)[0]
+                if "." in normalized_target
+                else ""
+            )
+            if (
+                call_name not in _ACTION_CONTRACT_CONSTRUCTORS
+                or target_module != _REGISTRY_DECORATOR_MODULE
+            ):
+                raise ValueError(
+                    "Action contract 不允许 callable 或动态表达式"
+                )
+            if value.args or any(keyword.arg is None for keyword in value.keywords):
+                raise ValueError("Action contract 构造器只允许关键字参数")
+            for keyword in value.keywords:
+                _validate(keyword.value)
+            return
+        raise ValueError("Action contract 不允许 callable 或动态表达式")
+
+    _validate(contract_node)
 
 
 # ---------------------------------------------------------------------------
@@ -730,13 +875,11 @@ def _resolve_attribute(node: ast.Attribute, import_map: Dict[str, str]) -> str:
     return ".".join(parts)
 
 
-def _ast_call_to_value(node: ast.Call, import_map: Dict[str, str]) -> dict:
+def _ast_call_to_value(node: ast.Call, import_map: Dict[str, str]) -> ASTCall:
     """
     Convert a function/class call like InputHandle(key="in", ...) to a structured dict.
 
-    Returns:
-        {"_call": "unilabos.registry.decorators:InputHandle",
-         "key": "in", "data_type": "fluid", ...}
+    返回与普通 JSON 字典隔离的 ``ASTCall`` 内部值。
     """
     # Resolve the call target
     if isinstance(node.func, ast.Name):
@@ -746,19 +889,19 @@ def _ast_call_to_value(node: ast.Call, import_map: Dict[str, str]) -> dict:
     else:
         call_name = "<unknown>"
 
-    result: dict = {"_call": call_name}
+    values: Dict[str, Any] = {}
 
     # Positional args
     for i, arg in enumerate(node.args):
-        result[f"_pos_{i}"] = _ast_node_to_value(arg, import_map)
+        values[f"_pos_{i}"] = _ast_node_to_value(arg, import_map)
 
     # Keyword args
     for kw in node.keywords:
         if kw.arg is None:
             continue
-        result[kw.arg] = _ast_node_to_value(kw.value, import_map)
+        values[kw.arg] = _ast_node_to_value(kw.value, import_map)
 
-    return result
+    return ASTCall(target=call_name, values=values)
 
 
 # ---------------------------------------------------------------------------
@@ -828,8 +971,9 @@ def _extract_class_body(
             continue
 
         # --- Check for @action ---
-        action_dec = _find_method_decorator(item, "action")
-        if action_dec is not None and _is_registry_decorator("action", import_map):
+        action_dec = _find_registry_method_decorator(item, "action", import_map)
+        if action_dec is not None:
+            _validate_action_contract_ast(action_dec, import_map)
             action_args = _extract_decorator_args(action_dec, import_map)
             # 补全 @action 装饰器的默认值（与 decorators.py 中 action() 签名一致）
             action_args.setdefault("action_type", None)
@@ -845,6 +989,9 @@ def _extract_class_body(
             action_args.setdefault("description", "")
             action_args.setdefault("auto_prefix", False)
             action_args.setdefault("parent", False)
+            action_args["contract"] = normalize_action_contract(
+                action_args.get("contract")
+            )
             method_params = _extract_method_params(item, import_map)
             return_type = _get_annotation_str(item.returns, import_map)
             is_async = isinstance(item, ast.AsyncFunctionDef)
@@ -996,7 +1143,7 @@ def _get_annotation_str(node: Optional[ast.expr], import_map: Dict[str, str]) ->
         return ""
 
     if isinstance(node, ast.Constant):
-        return str(node.value)
+        return repr(node.value)
 
     if isinstance(node, ast.Name):
         return node.id

@@ -23,6 +23,7 @@ from unilabos_msgs.action import EmptyIn, ResourceCreateFromOuter, ResourceCreat
 from unilabos_msgs.msg import Resource
 
 from unilabos.config.config import BasicConfig
+from unilabos.registry.ast_types import ASTCall
 from unilabos.registry.decorators import (
     get_device_meta,
     get_action_meta,
@@ -49,6 +50,7 @@ from unilabos.registry.utils import (
     normalize_ast_handles,
     normalize_ast_action_handles,
     wrap_action_schema,
+    embed_action_contract,
     preserve_field_descriptions,
     resolve_method_params_via_import,
     SIMPLE_TYPE_MAP,
@@ -320,6 +322,7 @@ class Registry:
             scan_result = scan_directory(
                 scan_root, python_path=python_path, executor=self._startup_executor,
                 cache=ast_cache, include_files=core_files,
+                raise_on_error=BasicConfig.check_mode,
             )
             logger.info(
                 f"[UniLab Registry] external_only 模式: 仅扫描核心文件 "
@@ -330,6 +333,7 @@ class Registry:
             scan_result = scan_directory(
                 scan_root, python_path=python_path, executor=self._startup_executor,
                 exclude_files=exclude_files, cache=ast_cache,
+                raise_on_error=BasicConfig.check_mode,
             )
             if exclude_files:
                 logger.info(
@@ -339,14 +343,17 @@ class Registry:
 
         # 合并缓存统计
         total_stats = scan_result.pop("_cache_stats", {"hits": 0, "misses": 0, "total": 0})
+        scan_errors = scan_result.pop("_errors", [])
 
         # 额外目录逐个扫描并合并
         for d_path in extra_dirs:
             extra_result = scan_directory(
                 d_path, python_path=str(d_path.parent), executor=self._startup_executor,
                 cache=ast_cache,
+                raise_on_error=BasicConfig.check_mode,
             )
             extra_stats = extra_result.pop("_cache_stats", {"hits": 0, "misses": 0, "total": 0})
+            scan_errors.extend(extra_result.pop("_errors", []))
             total_stats["hits"] += extra_stats["hits"]
             total_stats["misses"] += extra_stats["misses"]
             total_stats["total"] += extra_stats["total"]
@@ -367,6 +374,9 @@ class Registry:
                         f"@resource id 重复: '{rid}' 同时出现在 {existing} 和 {new_file}"
                     )
                 scan_result.setdefault("resources", {})[rid] = rmeta
+
+        for scan_error in scan_errors:
+            logger.warning(f"[UniLab Registry] {scan_error}")
 
         # 缓存命中统计
         if total_stats["total"] > 0:
@@ -884,20 +894,23 @@ class Registry:
                     "result", ret_type_str, None, imap
                 )
 
+            contract = (action_args or {}).get("contract")
+            schema = wrap_action_schema(
+                goal_schema,
+                action_name,
+                description=(action_args or {}).get("description") or method_doc_info.get("description", ""),
+                result_schema=result_schema,
+            )
             entry = {
                 "type": type_str,
                 "goal": goal,
                 "feedback": (action_args or {}).get("feedback") or {},
                 "result": (action_args or {}).get("result") or {},
-                "schema": wrap_action_schema(
-                    goal_schema,
-                    action_name,
-                    description=(action_args or {}).get("description") or method_doc_info.get("description", ""),
-                    result_schema=result_schema,
-                ),
+                "schema": embed_action_contract(schema, contract),
                 "goal_default": goal_default,
                 "handles": handles,
                 "placeholder_keys": pk,
+                "contract": contract,
             }
             if (action_args or {}).get("always_free") or method_info.get("always_free"):
                 entry["always_free"] = True
@@ -1022,18 +1035,20 @@ class Registry:
             result.update(result_override)
             goal_default.update(goal_default_override)
 
+            contract = action_args.get("contract")
             action_entry = {
                 "type": action_type.split(":")[-1],
                 "goal": goal,
                 "feedback": feedback,
                 "result": result,
-                "schema": schema,
+                "schema": embed_action_contract(schema, contract),
                 "goal_default": goal_default,
                 "handles": handles,
                 "placeholder_keys": {
                     **detect_placeholder_keys(method_params),
                     **(action_args.get("placeholder_keys") or {}),
                 },
+                "contract": contract,
             }
             if action_args.get("always_free") or method_info.get("always_free"):
                 action_entry["always_free"] = True
@@ -1092,10 +1107,8 @@ class Registry:
             entry["model"] = model
         hardware_interface = ast_meta.get("hardware_interface")
         if hardware_interface is not None:
-            # AST 解析 HardwareInterface(...) 得到 {"_call": "...", "name": ..., "read": ..., "write": ...}
-            # 归一化为 YAML 格式，去掉 _call
-            if isinstance(hardware_interface, dict) and "_call" in hardware_interface:
-                hardware_interface = {k: v for k, v in hardware_interface.items() if k != "_call"}
+            if isinstance(hardware_interface, ASTCall):
+                hardware_interface = hardware_interface.values
             entry["class"]["hardware_interface"] = hardware_interface
         return entry
 
@@ -1552,6 +1565,12 @@ class Registry:
             except Exception as e:
                 logger.debug(f"[Registry] 设备 {device_id} 动态增强失败: {e}")
 
+        for action_config in action_mappings.values():
+            action_config["schema"] = embed_action_contract(
+                action_config.get("schema"),
+                action_config.get("contract"),
+            )
+
         # 添加内置动作
         self._add_builtin_actions(entry, device_id)
 
@@ -1861,7 +1880,12 @@ class Registry:
                         if not k.startswith("auto-")
                     }
                     for k, v in enhanced_info["action_methods"].items():
-                        if k in device_config["class"]["action_value_mappings"]:
+                        action_args = v.get("action_args")
+                        if action_args is not None:
+                            action_key = action_args.get("action_name", k)
+                            if action_args.get("auto_prefix"):
+                                action_key = f"auto-{action_key}"
+                        elif k in device_config["class"]["action_value_mappings"]:
                             action_key = k
                         elif k.startswith("get_"):
                             continue
@@ -1891,7 +1915,17 @@ class Registry:
                                 new_schema["description"] = old_schema["description"]
                         new_schema.setdefault("description", "")
 
-                        old_type = old_cfg.get("type", "")
+                        source_action_type = (
+                            action_args.get("action_type")
+                            if action_args is not None
+                            else None
+                        )
+                        source_type_name = (
+                            str(source_action_type).split(":")[-1]
+                            if source_action_type
+                            else ""
+                        )
+                        old_type = old_cfg.get("type", "") or source_type_name
                         entry_goal = old_cfg.get("goal", {})
                         entry_feedback = {}
                         entry_result = {}
@@ -1968,9 +2002,66 @@ class Registry:
                         }
                         if v.get("always_free"):
                             entry["always_free"] = True
+                        if action_args is not None:
+                            entry["contract"] = action_args.get("contract")
                         old_node_type = old_cfg.get("node_type")
                         if old_node_type in [NodeType.ILAB.value, NodeType.MANUAL_CONFIRM.value]:
                             entry["node_type"] = old_node_type
+                        if action_args is not None and not old_cfg:
+                            for mapping_field in (
+                                "goal",
+                                "feedback",
+                                "result",
+                                "goal_default",
+                            ):
+                                source_mapping = action_args.get(mapping_field) or {}
+                                merged_mapping = dict(entry.get(mapping_field) or {})
+                                merged_mapping.update(source_mapping)
+                                entry[mapping_field] = merged_mapping
+
+                            raw_handles = action_args.get("handles")
+                            if isinstance(raw_handles, list):
+                                entry["handles"] = normalize_ast_action_handles(
+                                    raw_handles
+                                )
+                            elif isinstance(raw_handles, dict):
+                                entry["handles"] = copy.deepcopy(raw_handles)
+
+                            source_placeholder_keys = (
+                                action_args.get("placeholder_keys") or {}
+                            )
+                            entry["placeholder_keys"].update(
+                                source_placeholder_keys
+                            )
+                            entry["feedback_interval"] = action_args.get(
+                                "feedback_interval",
+                                1.0,
+                            )
+                            source_node_type = normalize_enum_value(
+                                action_args.get("node_type"),
+                                NodeType,
+                            )
+                            if source_node_type:
+                                entry["node_type"] = source_node_type
+                            source_description = action_args.get("description")
+                            if source_description:
+                                entry["schema"]["description"] = (
+                                    source_description
+                                )
+                        if action_args is not None and old_cfg:
+                            enhanced_entry = entry
+                            entry = copy.deepcopy(old_cfg)
+                            entry["schema"] = enhanced_entry["schema"]
+                            for field_name, field_value in enhanced_entry.items():
+                                entry.setdefault(field_name, field_value)
+                            entry["contract"] = action_args.get("contract")
+                        if action_args is not None:
+                            contract = action_args.get("contract")
+                            entry["contract"] = contract
+                            entry["schema"] = embed_action_contract(
+                                entry.get("schema"),
+                                contract,
+                            )
                         device_config["class"]["action_value_mappings"][action_key] = entry
 
                     device_config["init_param_schema"] = {}

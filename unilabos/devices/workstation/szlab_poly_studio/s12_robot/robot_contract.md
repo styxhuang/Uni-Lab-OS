@@ -75,7 +75,7 @@ Examples:
 
 Sensor values are PLC->PC. `True` means occupied; `False` means empty. Every pick action requires the source sensor to be `True`; every place action requires the target sensor to be `False`. If the gate fails, Uni-LabOS does not write action variables or `任务号`.
 
-For PLC connectivity-only debugging, `SKIP_SENSOR_PRECHECK=1` skips these pick/place sensor gates. This is only for confirming read/write behavior with the upper computer; it can allow task writes even when source/target physical state is not valid.
+`SKIP_SENSOR_PRECHECK` and `SKIP_ROBOT_PRECHECK_VARIABLES` do not bypass ActionContract assertions. This is an intentional breaking change: observable OPC preconditions are always asserted immediately before hardware writes.
 
 Confirmed built-in mappings:
 
@@ -96,7 +96,7 @@ Confirmed built-in mappings:
 
 - `MODE=pick|place|both` selects action direction.
 - `PRODUCT_TYPES="1"` limits product type enumeration.
-- `SKIP_SENSOR_PRECHECK=1` skips source/target sensor gates.
+- Legacy sensor-skip environment variables do not affect ActionContract assertions.
 - `SKIP_ROBOT_HANDSHAKE_CHECK=1` skips `Robot_Home`, `Robot_任务允许写入`, and `Robot_任务完成` checks for PLC connectivity-only write tests.
 - `SKIP_RESET_AFTER_RUN=1` keeps successful task parameter values visible after completion while still clearing `Robot_任务写入完成`.
 - `CLEAR_PC_TO_PLC_BEFORE_RUN=1` still clears PC->PLC values before each case.

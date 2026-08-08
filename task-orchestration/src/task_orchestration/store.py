@@ -11,7 +11,7 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 from collections.abc import Callable
-from typing import Iterator
+from typing import Any, Iterator
 
 from .models import VersionedWorkspaceResponse, Workspace
 
@@ -45,6 +45,20 @@ class WorkspaceStore:
         sidecar = self._sidecar_path(path)
         with self._lock, self._sidecar_lock(sidecar, fcntl.LOCK_SH):
             return self._read_current(sidecar, relative_path)
+
+    def read_workflow(self, workflow_path: str) -> dict[str, Any]:
+        """在工作区边界内读取权威 workflow JSON。"""
+        path, _ = self._resolve_workflow_path(workflow_path)
+        if path.is_symlink():
+            raise WorkflowPathError("workflow must not be a symlink")
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise WorkflowPathError("workflow JSON 无法读取") from exc
+        if not isinstance(payload, dict):
+            raise WorkflowPathError("workflow JSON 顶层必须是对象")
+        return payload
 
     def put(
         self,
@@ -159,14 +173,24 @@ class WorkspaceStore:
             raise WorkflowPathError("workflow_path is required")
         raw_path = Path(workflow_path)
         candidate = raw_path if raw_path.is_absolute() else self._root / raw_path
-        resolved = candidate.resolve()
+        normalized = Path(os.path.abspath(candidate))
         try:
-            relative = resolved.relative_to(self._root)
+            relative = normalized.relative_to(self._root)
         except ValueError as exc:
             raise WorkflowPathError("workflow_path escapes workspace root") from exc
         if not relative.parts:
             raise WorkflowPathError("workflow_path must name a file")
-        return resolved, relative.as_posix()
+        current = self._root
+        for part in relative.parts:
+            current /= part
+            if current.is_symlink():
+                raise WorkflowPathError("workflow path must not contain symlinks")
+        resolved = normalized.resolve()
+        try:
+            resolved_relative = resolved.relative_to(self._root)
+        except ValueError as exc:
+            raise WorkflowPathError("workflow_path escapes workspace root") from exc
+        return resolved, resolved_relative.as_posix()
 
     @staticmethod
     def _sidecar_path(workflow_path: Path) -> Path:
@@ -223,57 +247,37 @@ class WorkspaceStore:
         try:
             with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
-            return VersionedWorkspaceResponse.model_validate(
-                self._migrate_legacy_sidecar_payload(payload)
-            )
+            self._reject_legacy_template_schema(payload)
+            return VersionedWorkspaceResponse.model_validate(payload)
         except (json.JSONDecodeError, ValueError) as exc:
             raise SidecarCorruptionError("invalid task workspace sidecar") from exc
 
     @staticmethod
-    def _migrate_legacy_sidecar_payload(payload: object) -> object:
-        """仅在磁盘读取边界迁移已发布过的旧 sidecar 契约。"""
+    def _reject_legacy_template_schema(payload: object) -> None:
+        """旧模板 sidecar 不迁移，缺少编译字段时显式判坏。"""
         if not isinstance(payload, dict):
-            return payload
+            return
         workspace = payload.get("workspace")
         if not isinstance(workspace, dict):
-            return payload
-        templates: list[object] = []
-        template_node_counts: dict[str, int] = {}
-        for item in workspace.get("templates", []):
-            if not isinstance(item, dict):
-                templates.append(item)
-                continue
-            migrated = dict(item)
-            migrated.pop("trigger", None)
-            templates.append(migrated)
-            node_ids = migrated.get("node_ids", [])
-            template_node_counts[str(migrated.get("id"))] = (
-                len(node_ids) if isinstance(node_ids, list) else 0
-            )
-        instances: list[object] = []
-        for item in workspace.get("task_instances", []):
-            if (
-                isinstance(item, dict)
-                and item.get("status") == "completed"
-                and "execution_state" not in item
-            ):
-                item = {
-                    **item,
-                    "execution_state": {
-                        "cursor": template_node_counts.get(
-                            str(item.get("template_id")), 0
-                        )
-                    },
-                }
-            instances.append(item)
-        return {
-            **payload,
-            "workspace": {
-                **workspace,
-                "templates": templates,
-                "task_instances": instances,
-            },
+            return
+        templates = workspace.get("templates", [])
+        if not isinstance(templates, list):
+            return
+        required = {
+            "schema_version",
+            "node_contracts",
+            "admission_gates",
+            "resource_requirements",
         }
+        if any(
+            isinstance(template, dict)
+            and (
+                template.get("schema_version") != 2
+                or not required.issubset(template)
+            )
+            for template in templates
+        ):
+            raise SidecarCorruptionError("legacy task template schema is unsupported")
 
     @staticmethod
     def _write_json_atomically(path: Path, payload: dict[str, object]) -> None:

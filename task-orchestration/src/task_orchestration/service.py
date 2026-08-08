@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-import json
 import threading
 import time
 from typing import Any
 from uuid import uuid4
 
+from .action_catalog import ActionCatalog
+from .compiler import (
+    TemplateCompilationError,
+    WorkflowActionNode,
+    compile_template_contract,
+)
 from .conditions import OpcConditionProvider
 from .models import (
     NodeExecutionRecord,
@@ -18,7 +23,7 @@ from .models import (
     TaskScheduleEntry,
     TaskInstance,
     Template,
-    Trigger,
+    TemplateDraft,
     WaitingReason,
     Workspace,
     WorkspaceEvent,
@@ -26,14 +31,21 @@ from .models import (
 )
 from .policy import FifoResourcePolicy, SchedulingPolicy
 from .store import WorkspaceStore
+from .workflow_nodes import extract_workflow_nodes
 
 
 class WorkspaceServiceError(ValueError):
     """业务规则不满足。"""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.detail = detail or {}
 
 
 def _json_values_equal(left, right) -> bool:
@@ -62,12 +74,14 @@ class WorkspaceService:
         conditions: OpcConditionProvider | None = None,
         policy: SchedulingPolicy | None = None,
         clock: Callable[[], int] | None = None,
+        action_catalog: ActionCatalog | None = None,
     ) -> None:
         self.store = store
         self.conditions = conditions or OpcConditionProvider()
         self.policy = policy or FifoResourcePolicy()
         self._opc_lock = threading.RLock()
         self._clock = clock or (lambda: int(time.time() * 1000))
+        self.action_catalog = action_catalog
 
     def _mutate(
         self,
@@ -127,18 +141,15 @@ class WorkspaceService:
             return response
 
     def create_template(
-        self, workflow_path: str, expected_version: int, template: Template
+        self, workflow_path: str, expected_version: int, template: TemplateDraft
     ):
+        compiled_template = self._compile_template(workflow_path, template)
+
         def operation(workspace: Workspace) -> Workspace:
-            if any(item.id == template.id for item in workspace.templates):
+            if any(item.id == compiled_template.id for item in workspace.templates):
                 raise WorkspaceServiceError("template_exists", "template already exists")
-            item = self._canonicalize_template_triggers(workspace, template)
-            self._validate_template_conditions(workspace, item)
-            item = item.model_copy(
-                update={
-                    "workflow_path": workspace.workflow_path,
-                    "resources": [],
-                }
+            item = compiled_template.validated_copy(
+                update={"workflow_path": workspace.workflow_path}
             )
             return workspace.model_copy(update={"templates": [*workspace.templates, item]})
 
@@ -153,30 +164,31 @@ class WorkspaceService:
         template_id: str,
         *,
         name: str | None = None,
-        input_triggers: list[Trigger] | None = None,
-        output_triggers: list[Trigger] | None = None,
+        node_ids: list[str] | None = None,
     ):
+        current = self.store.get(workflow_path).workspace
+        existing = self._template(current, template_id)
+        if name is not None and not name.strip():
+            raise WorkspaceServiceError(
+                "invalid_template_name",
+                "模板名称不能为空",
+            )
+        draft = TemplateDraft(
+            id=existing.id,
+            name=existing.name if name is None else name.strip(),
+            node_ids=existing.node_ids if node_ids is None else node_ids,
+        )
+        replacement = self._compile_template(workflow_path, draft)
+
         def operation(workspace: Workspace) -> Workspace:
-            template = self._template(workspace, template_id)
-            updates = {}
-            if name is not None:
-                if not name.strip():
-                    raise WorkspaceServiceError("invalid_template_name", "template name is required")
-                updates["name"] = name.strip()
-            if input_triggers is not None:
-                updates["input_triggers"] = self._canonicalize_triggers(
-                    workspace, input_triggers, "input"
-                )
-            if output_triggers is not None:
-                updates["output_triggers"] = self._canonicalize_triggers(
-                    workspace, output_triggers, "output"
-                )
-            updates["resources"] = []
-            replacement = template.model_copy(update=updates)
+            self._template(workspace, template_id)
+            stored = replacement.validated_copy(
+                update={"workflow_path": workspace.workflow_path}
+            )
             return workspace.model_copy(
                 update={
                     "templates": [
-                        replacement if item.id == template_id else item
+                        stored if item.id == template_id else item
                         for item in workspace.templates
                     ]
                 }
@@ -213,17 +225,9 @@ class WorkspaceService:
                     if item.plc_device_id != registration.plc_device_id
                 ]
                 registrations.append(registration)
-                templates = [
-                    self._canonicalize_template_triggers(
-                        workspace.model_copy(update={"plc_registrations": registrations}),
-                        template,
-                    )
-                    for template in workspace.templates
-                ]
                 return workspace.model_copy(
                     update={
                         "plc_registrations": registrations,
-                        "templates": templates,
                         "opc_snapshots": [
                             item
                             for item in workspace.opc_snapshots
@@ -708,7 +712,7 @@ class WorkspaceService:
         result,
         release_resources: Iterable[str],
     ):
-        """幂等完成活动动作，推进游标并通过输出条件门控 Task 完成。"""
+        """幂等完成活动动作并推进游标；本阶段不执行模板准入条件。"""
         del release_resources
 
         def operation(workspace: Workspace) -> Workspace | None:
@@ -982,15 +986,6 @@ class WorkspaceService:
                                     template_id=self._instance(provisional, item_id).template_id,
                                     timestamp=transition_time,
                                     idempotency_key=f"instance/{item_id}/scheduled",
-                                    payload={
-                                        "satisfied_triggers": [
-                                            trigger.model_dump(mode="json")
-                                            for trigger in self._template(
-                                                provisional,
-                                                self._instance(provisional, item_id).template_id,
-                                            ).input_triggers
-                                        ],
-                                    },
                                 )
                                 for item_id in schedule.startable_instance_ids
                             ),
@@ -1031,22 +1026,8 @@ class WorkspaceService:
                     ),
                 )
                 continue
-            template = self._template(workspace, instance.template_id)
-            reason = self._evaluate_triggers(workspace, template.input_triggers)
-            if reason is None:
-                satisfied.add(instance.id)
-            else:
-                reasons[instance.id] = reason
+            satisfied.add(instance.id)
         return satisfied, reasons
-
-    def _evaluate_triggers(
-        self, workspace: Workspace, triggers: Iterable[Trigger]
-    ) -> WaitingReason | None:
-        for trigger in triggers:
-            result = self.conditions.evaluate(workspace.workflow_path, trigger)
-            if not result.satisfied:
-                return result.reason or WaitingReason(code="condition_unsatisfied")
-        return None
 
     def _hydrate_conditions(self, workspace: Workspace) -> None:
         for state in workspace.opc_snapshots:
@@ -1064,65 +1045,6 @@ class WorkspaceService:
             ),
             None,
         )
-
-    def _validate_template_conditions(
-        self, workspace: Workspace, template: Template
-    ) -> None:
-        self._validate_triggers(workspace, template.input_triggers, "input")
-        self._validate_triggers(workspace, template.output_triggers, "output")
-
-    def _canonicalize_template_triggers(
-        self, workspace: Workspace, template: Template
-    ) -> Template:
-        """将模板中的别名条件转换为可持久化的 CSV 真实节点名。"""
-        return template.model_copy(
-            update={
-                "input_triggers": self._canonicalize_triggers(
-                    workspace, template.input_triggers, "input"
-                ),
-                "output_triggers": self._canonicalize_triggers(
-                    workspace, template.output_triggers, "output"
-                ),
-            }
-        )
-
-    def _canonicalize_triggers(
-        self, workspace: Workspace, triggers: Iterable[Trigger], phase: str
-    ) -> list[Trigger]:
-        trigger_list = list(triggers)
-        self._validate_triggers(workspace, trigger_list, phase)
-        canonical_triggers: list[Trigger] = []
-        for trigger in trigger_list:
-            config = dict(trigger.config)
-            registration = self._registration(
-                workspace, str(config["plc_device_id"])
-            )
-            assert registration is not None
-            config["variable"] = registration.canonical_variable_name(
-                str(config["variable"])
-            )
-            canonical_triggers.append(trigger.model_copy(update={"config": config}))
-        return canonical_triggers
-
-    def _validate_triggers(
-        self, workspace: Workspace, triggers: Iterable[Trigger], phase: str
-    ) -> None:
-        trigger_list = list(triggers)
-        for trigger in trigger_list:
-            config = trigger.config
-            plc_device_id = str(config["plc_device_id"])
-            variable = str(config["variable"])
-            registration = self._registration(workspace, plc_device_id)
-            canonical_variable = (
-                registration.canonical_variable_name(variable)
-                if registration is not None
-                else variable
-            )
-            if registration is None or canonical_variable not in registration.variables:
-                raise WorkspaceServiceError(
-                    "unregistered_plc_variable",
-                    f"PLC variable is not registered: {plc_device_id}.{variable}",
-                )
 
     def _validate_snapshot_variables(
         self, workspace: Workspace, plc_device_id: str, variables: Iterable[str]
@@ -1309,25 +1231,89 @@ class WorkspaceService:
                 instance_id=instance.id,
                 timestamp=timestamp,
                 idempotency_key=f"instance/{instance.id}/completed",
-            ),
-            *[
-                WorkspaceEvent(
-                    kind="output",
-                    instance_id=instance.id,
-                    template_id=instance.template_id,
-                    timestamp=timestamp,
-                    idempotency_key=(
-                        f"instance/{instance.id}/output/"
-                        f"{json.dumps(trigger.model_dump(mode='json'), sort_keys=True)}"
-                    ),
-                    payload={
-                        "trigger": trigger.model_dump(mode="json"),
-                        "delivery": "recorded_without_opc_write",
-                    },
-                )
-                for trigger in template.output_triggers
-            ],
+            )
         ]
+
+    def _compile_template(
+        self,
+        workflow_path: str,
+        draft: TemplateDraft,
+    ) -> Template:
+        """仅依据服务端 workflow 与 Action catalog 生成模板契约。"""
+        if self.action_catalog is None:
+            raise WorkspaceServiceError(
+                "action_catalog_unavailable",
+                "服务端 Action catalog 不可用",
+            )
+        workflow = self.store.read_workflow(workflow_path)
+        action_nodes: list[WorkflowActionNode] = []
+        seen_ids: set[str] = set()
+        selected_ids = set(draft.node_ids)
+        try:
+            workflow_nodes = extract_workflow_nodes(workflow)
+        except ValueError as exc:
+            raise WorkspaceServiceError(
+                "invalid_workflow_node",
+                str(exc),
+            ) from exc
+        for node in workflow_nodes:
+            node_id = node.node_id
+            if node_id in seen_ids:
+                raise WorkspaceServiceError(
+                    "duplicate_workflow_node_id",
+                    f"workflow node_id 重复: {node_id}",
+                    {"node_id": node_id},
+                )
+            seen_ids.add(node_id)
+            contract: dict[str, Any] | None = None
+            if node.is_action and node_id in selected_ids:
+                exists, contract = self.action_catalog.action_contract(
+                    node.device_id, node.method
+                )
+                if not exists:
+                    raise WorkspaceServiceError(
+                        "action_schema_not_found",
+                        f"Action schema 不存在: {node.device_id}.{node.method}",
+                        {
+                            "node_id": node_id,
+                            "device_id": node.device_id,
+                            "method": node.method,
+                        },
+                    )
+            if node_id in selected_ids and not isinstance(node.params, dict):
+                raise WorkspaceServiceError(
+                    "invalid_action_parameters",
+                    f"Action params 必须是对象: {node_id}",
+                    {"node_id": node_id},
+                )
+            action_nodes.append(
+                WorkflowActionNode(
+                    node_id=node_id,
+                    device_id=node.device_id,
+                    method=node.method,
+                    params=node.params if isinstance(node.params, dict) else {},
+                    action_contract=contract,
+                    is_action=node.is_action,
+                )
+            )
+        try:
+            compiled = compile_template_contract(draft.node_ids, action_nodes)
+        except TemplateCompilationError as exc:
+            raise WorkspaceServiceError(
+                exc.code,
+                str(exc),
+                exc.detail,
+            ) from exc
+        return Template(
+            schema_version=2,
+            id=draft.id,
+            name=draft.name,
+            workflow_path=workflow_path,
+            node_ids=list(draft.node_ids),
+            node_contracts=compiled.node_contracts,
+            admission_gates=compiled.admission_gates,
+            resource_requirements=compiled.resource_requirements,
+        )
 
     @staticmethod
     def _template(workspace: Workspace, template_id: str) -> Template:

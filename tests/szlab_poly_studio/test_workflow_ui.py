@@ -603,6 +603,13 @@ def test_s07_robot_preset_includes_robot_and_solid_addition_station():
         ),
     }
     assert preset.actions["submit_place_to_s071"].device_id == "szlab_mixer_robot"
+    s071_position = next(
+        param
+        for param in preset.actions["submit_place_to_s071"].params
+        if param["name"] == "position"
+    )
+    assert "auto" not in s071_position["description"].lower()
+    assert "必须明确指定" in s071_position["description"]
     assert (
         preset.actions["scan_powder_cartridges"].device_id == "szlab_s07_solid_addition"
     )
@@ -988,7 +995,9 @@ def test_single_sample_workflow_uses_internal_s09_balance_read_and_correct_robot
     ]
     by_id = {action["workflow_node_id"]: action for action in actions}
     assert by_id["p02_powder_1_pick_and_rotate"]["params"]["load_position"] == 1
+    assert by_id["p02_powder_1_pick_and_rotate"]["params"]["position"] == "1-1"
     assert by_id["p02_powder_2_pick_and_rotate"]["params"]["load_position"] == 2
+    assert by_id["p02_powder_2_pick_and_rotate"]["params"]["position"] == "1-2"
     assert by_id["w01_place_beaker_s072"]["params"]["product_type"] == 2
     assert by_id["w02_pick_beaker_s072"]["params"]["product_type"] == 2
     assert by_id["p03_reagent_place_s08"]["params"]["product_type"] == 3
@@ -1005,7 +1014,7 @@ def test_szlab_robot_action_workflow_does_not_auto_apply_debug_sensor_skips(monk
     assert "SKIP_ROBOT_PRECHECK_VARIABLES" not in os.environ
 
 
-def test_szlab_robot_action_workflow_explicit_debug_skips_s03_pick_sensor_gate(
+def test_szlab_robot_action_workflow_debug_env_does_not_bypass_contract_assertion(
     monkeypatch,
 ):
     from unilabos.devices.workstation.szlab_poly_studio.s12_robot.robot import (
@@ -1016,12 +1025,22 @@ def test_szlab_robot_action_workflow_explicit_debug_skips_s03_pick_sensor_gate(
     monkeypatch.setenv("SKIP_ROBOT_PRECHECK_VARIABLES", "")
     apply_preset_debug_config("szlab_robot_action_workflow")
 
-    device = SzlabMixerRobotDevice(auto_connect=False)
-    result = device._ensure_sensor_gate(
-        "传感器状态_上位机[0].NO[6]", True, "S03 取料源位必须有物料"
-    )
+    class Gateway:
+        def read_variable(self, name, use_cache=False):
+            del name, use_cache
+            return False
 
-    assert result is None
+    device = SzlabMixerRobotDevice(auto_connect=False)
+    device.set_plc_gateway(Gateway())
+    contract = device._resolved_action_contract(
+        "submit_pick_from_s03",
+        {"product_type": 1, "position": "1-1"},
+    )
+    result = device._assert_contract_conditions(contract)
+
+    assert os.environ["SKIP_SENSOR_PRECHECK"] == "1"
+    assert result["success"] is False
+    assert result["mismatches"][0]["actual"] is False
 
 
 def test_szlab_robot_action_workflow_flow_matches_requested_synthesis_route():
@@ -1049,6 +1068,8 @@ def test_szlab_robot_action_workflow_flow_matches_requested_synthesis_route():
         ("szlab_mixer_robot", "submit_place_to_s10"),
     ]
     assert actions[0]["params"] == {"product_type": 1, "position": "1-1"}
+    assert actions[1]["params"] == {"product_type": 2}
+    assert actions[3]["params"] == {"product_type": 2}
     assert actions[2]["params"]["recipe_name"] == "default"
     assert actions[5]["params"] == {
         "process": 3,

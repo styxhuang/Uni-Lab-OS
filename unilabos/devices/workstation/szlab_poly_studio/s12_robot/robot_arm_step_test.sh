@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # SZLab robot 单步调试脚本。
-# 默认只跑一个动作、一个 position、一个 sensor；跳过 Robot_Home，但保留 sensor/允许写入/完成检查。
+# 默认只跑一个动作；实体 OPC 条件由 ActionContract 强制断言。
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || (cd "$SCRIPT_DIR/../../../../../.." && pwd))"
@@ -29,16 +29,15 @@ PRODUCT_TYPE="${PRODUCT_TYPE:-1}"
 POSITION="${POSITION:-1}"
 SAMPLE_ID="${SAMPLE_ID:-step-debug}"
 
-# 单步调试默认跳过 Robot_Home，但不跳过 sensor 检查。
+# 单步调试默认仅跳过握手中的 Robot_Home。
 SKIP_ROBOT_PRECHECK_VARIABLES="${SKIP_ROBOT_PRECHECK_VARIABLES:-Robot_Home}"
-SKIP_SENSOR_PRECHECK="${SKIP_SENSOR_PRECHECK:-0}"
 SKIP_ROBOT_HANDSHAKE_CHECK="${SKIP_ROBOT_HANDSHAKE_CHECK:-0}"
 SKIP_RESET_AFTER_RUN="${SKIP_RESET_AFTER_RUN:-0}"
 CLEAR_PC_TO_PLC_BEFORE_RUN="${CLEAR_PC_TO_PLC_BEFORE_RUN:-1}"
 IGNORE_OPCUA_TOKEN_TIME_DRIFT="${IGNORE_OPCUA_TOKEN_TIME_DRIFT:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 CONFIRM="${CONFIRM:-}"
-export SKIP_ROBOT_PRECHECK_VARIABLES SKIP_SENSOR_PRECHECK SKIP_ROBOT_HANDSHAKE_CHECK SKIP_RESET_AFTER_RUN
+export SKIP_ROBOT_PRECHECK_VARIABLES SKIP_ROBOT_HANDSHAKE_CHECK SKIP_RESET_AFTER_RUN
 
 usage() {
   cat <<'EOF'
@@ -54,7 +53,6 @@ usage() {
   DRY_RUN=1                   只打印 workflow，不连接 PLC
   SKIP_ROBOT_PRECHECK_VARIABLES=Robot_Home
                                跳过指定 Robot 前置变量检查，默认只跳过 Robot_Home
-  SKIP_SENSOR_PRECHECK=1      跳过 sensor 检查，默认关闭
   SKIP_RESET_AFTER_RUN=1      完成后保留任务号/Sxx参数；默认完成后全部清零
   WRITE_DONE_HOLD_SECONDS=2   Robot_任务写入完成=True 的保持秒数，默认 2
 
@@ -114,13 +112,12 @@ ensure_files() {
 }
 
 build_case() {
-  "$PYTHON" - "$STATION" "$TASK" "$POSITION" "$PRODUCT_TYPE" "$SAMPLE_ID" "$SKIP_SENSOR_PRECHECK" <<'PY'
+  "$PYTHON" - "$STATION" "$TASK" "$POSITION" "$PRODUCT_TYPE" "$SAMPLE_ID" <<'PY'
 import json
 import sys
 
-station, task, position, product_type, sample_id, skip_sensor_precheck = sys.argv[1:7]
+station, task, position, product_type, sample_id = sys.argv[1:6]
 product_type = int(product_type)
-skip_sensor_precheck = skip_sensor_precheck == "1"
 
 ROW_COL_STATIONS = {"S03", "S071", "S11"}
 NUMBERED_STATIONS = {"S02", "S04", "S08", "S09", "S10", "S072"}
@@ -176,7 +173,9 @@ def params_for(station_name: str) -> tuple[str, dict]:
         return f"{prefix}_{station_name.lower()}", ({"sample_id": sample_id} if station_name == "S05" else {})
     if station_name == "S071":
         return f"{prefix}_s071", {"position": position}
-    if station_name in {"S072", "S08", "S09"}:
+    if station_name == "S072":
+        return f"{prefix}_s072", {"product_type": product_type}
+    if station_name in {"S08", "S09"}:
         return f"{prefix}_{station_name.lower()}", {"product_type": product_type, "position": int(position)}
     if station_name in {"S02", "S10"}:
         return f"{prefix}_{station_name.lower()}", {"position": int(position)}
@@ -185,10 +184,10 @@ def params_for(station_name: str) -> tuple[str, dict]:
     raise ValueError(f"暂不支持工位: {station_name}")
 
 sensor = SENSORS.get(station, {}).get(str(position))
-if not sensor and not skip_sensor_precheck:
+if not sensor and station not in {"S01", "S072", "S09"}:
     raise ValueError(f"找不到默认 sensor: station={station}, position={position_label} mapped={position}")
 action, params = params_for(station)
-print(json.dumps({"action": action, "params": params, "sensor": sensor or "SKIPPED", "position": position}, ensure_ascii=False))
+print(json.dumps({"action": action, "params": params, "sensor": sensor or "LOGICAL_OCCUPANCY", "position": position}, ensure_ascii=False))
 PY
 }
 
@@ -298,7 +297,6 @@ TASK: $TASK
 POSITION: $POSITION
 PRODUCT_TYPE: $PRODUCT_TYPE
 SKIP_ROBOT_PRECHECK_VARIABLES: $SKIP_ROBOT_PRECHECK_VARIABLES
-SKIP_SENSOR_PRECHECK: $SKIP_SENSOR_PRECHECK
 
 请确认现场安全、路径无障碍、目标工位 sensor 状态与 $TASK 条件匹配。
 EOF
@@ -334,7 +332,7 @@ run_step() {
   echo "跳过 Robot前置变量: $SKIP_ROBOT_PRECHECK_VARIABLES"
   echo "Robot_任务写入完成保持秒数: $WRITE_DONE_HOLD_SECONDS"
   echo "完成后清除任务参数: $([[ "$SKIP_RESET_AFTER_RUN" == "1" ]] && echo no || echo yes)"
-  echo "sensor 检查: $([[ "$SKIP_SENSOR_PRECHECK" == "1" ]] && echo skipped || echo enabled)"
+  echo "实体 OPC 条件: ActionContract 强制断言"
   echo "log: $log_file"
 
   if [[ "$DRY_RUN" == "1" ]]; then

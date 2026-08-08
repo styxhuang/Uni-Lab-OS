@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from msgcenterpy.instances.typed_dict_instance import TypedDictMessageInstance
 
 from unilabos.utils.cls_creator import import_class
+from unilabos.registry.ast_types import ASTCall
 from unilabos.registry.decorators import Side, DataSource, normalize_enum_value
 
 _logger = logging.getLogger(__name__)
@@ -29,6 +30,17 @@ _logger = logging.getLogger(__name__)
 
 class ROSMsgNotFound(Exception):
     pass
+
+
+def embed_action_contract(
+    schema: Optional[Dict[str, Any]],
+    contract: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """将 Action entry 的同一份契约对象暴露到标准 schema。"""
+    result = schema if isinstance(schema, dict) else {}
+    if contract is not None:
+        result["contract"] = contract
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -509,8 +521,15 @@ def normalize_ast_handles(handles_raw: Any) -> List[Dict[str, Any]]:
 
     result: List[Dict[str, Any]] = []
     for h in handles_raw:
-        if isinstance(h, dict):
-            call = h.get("_call", "")
+        if isinstance(h, ASTCall):
+            call = h.target
+            handle_values = h.values
+        elif isinstance(h, dict):
+            call = ""
+            handle_values = h
+        else:
+            continue
+        if isinstance(handle_values, dict):
             if "InputHandle" in call:
                 handle_type = "input"
             elif "OutputHandle" in call:
@@ -520,28 +539,28 @@ def normalize_ast_handles(handles_raw: Any) -> List[Dict[str, Any]]:
             elif "ActionOutputHandle" in call:
                 handle_type = "action_output"
             else:
-                handle_type = h.get("handle_type", "unknown")
+                handle_type = handle_values.get("handle_type", "unknown")
 
             io_type = _HANDLE_TYPE_TO_IO_TYPE.get(handle_type, handle_type)
 
             entry: Dict[str, Any] = {
-                "handler_key": h.get("key", ""),
-                "data_type": h.get("data_type", ""),
+                "handler_key": handle_values.get("key", ""),
+                "data_type": handle_values.get("data_type", ""),
                 "io_type": io_type,
             }
-            side = h.get("side")
+            side = handle_values.get("side")
             if side:
                 entry["side"] = normalize_enum_value(side, Side) or side
-            label = h.get("label")
+            label = handle_values.get("label")
             if label:
                 entry["label"] = label
-            data_key = h.get("data_key")
+            data_key = handle_values.get("data_key")
             if data_key:
                 entry["data_key"] = data_key
-            data_source = h.get("data_source")
+            data_source = handle_values.get("data_source")
             if data_source:
                 entry["data_source"] = normalize_enum_value(data_source, DataSource) or data_source
-            description = h.get("description")
+            description = handle_values.get("description")
             if description:
                 entry["description"] = description
 
@@ -564,20 +583,25 @@ def normalize_ast_action_handles(handles_raw: Any) -> Dict[str, Any]:
     output_list: List[Dict[str, Any]] = []
 
     for h in handles_raw:
-        if not isinstance(h, dict):
+        if isinstance(h, ASTCall):
+            call = h.target
+            handle_values = h.values
+        elif isinstance(h, dict):
+            call = ""
+            handle_values = h
+        else:
             continue
-        call = h.get("_call", "")
         is_input = "ActionInputHandle" in call or "InputHandle" in call
         is_output = "ActionOutputHandle" in call or "OutputHandle" in call
 
         entry: Dict[str, Any] = {
-            "handler_key": h.get("key", ""),
-            "data_type": h.get("data_type", ""),
-            "label": h.get("label", ""),
+            "handler_key": handle_values.get("key", ""),
+            "data_type": handle_values.get("data_type", ""),
+            "label": handle_values.get("label", ""),
         }
         _FIELD_ENUM_MAP = {"side": Side, "data_source": DataSource}
         for opt_key in ("side", "data_key", "data_source", "description", "io_type"):
-            val = h.get(opt_key)
+            val = handle_values.get(opt_key)
             if val is not None:
                 if opt_key in _FIELD_ENUM_MAP:
                     val = normalize_enum_value(val, _FIELD_ENUM_MAP[opt_key]) or val

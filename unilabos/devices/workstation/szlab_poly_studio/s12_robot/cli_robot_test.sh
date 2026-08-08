@@ -29,7 +29,6 @@ LOG_DIR="${LOG_DIR:-$REPO_ROOT/unilabos_data/szlab_poly_studio/robot_cli_logs}"
 #   CONTINUE_ON_ERROR=1     单个用例失败后继续，默认继续
 #   IGNORE_OPCUA_TOKEN_TIME_DRIFT=1  忽略 OPC UA token 时间漂移，仅用于现场调试
 #   CLEAR_PC_TO_PLC_BEFORE_RUN=1     每个真实用例执行前先清空 PC->PLC 写入变量
-#   SKIP_SENSOR_PRECHECK=1           跳过取/放传感器门禁，仅用于 PLC 连通性写入测试
 #   SKIP_ROBOT_HANDSHAKE_CHECK=1     跳过 Robot_Home/允许写入/完成等待，仅用于 PLC 连通性写入测试
 #   SKIP_RESET_AFTER_RUN=1           任务完成后保留任务号/Sxx参数；默认完成后全部清零
 MODE="${MODE:-both}"
@@ -38,10 +37,9 @@ CONFIRM="${CONFIRM:-}"
 CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-1}"
 IGNORE_OPCUA_TOKEN_TIME_DRIFT="${IGNORE_OPCUA_TOKEN_TIME_DRIFT:-1}"
 CLEAR_PC_TO_PLC_BEFORE_RUN="${CLEAR_PC_TO_PLC_BEFORE_RUN:-1}"
-SKIP_SENSOR_PRECHECK="${SKIP_SENSOR_PRECHECK:-0}"
 SKIP_ROBOT_HANDSHAKE_CHECK="${SKIP_ROBOT_HANDSHAKE_CHECK:-0}"
 SKIP_RESET_AFTER_RUN="${SKIP_RESET_AFTER_RUN:-0}"
-export SKIP_SENSOR_PRECHECK SKIP_ROBOT_HANDSHAKE_CHECK SKIP_RESET_AFTER_RUN
+export SKIP_ROBOT_HANDSHAKE_CHECK SKIP_RESET_AFTER_RUN
 
 # 参数覆盖:
 #   PRODUCT_TYPES="1 2 3"   产品类型。1=烧杯/TIP，2=250ml样品瓶，3=500ml样品瓶/烧杯(按动作定义)
@@ -326,10 +324,9 @@ elif station in {"S07", "S071"}:
 
 if station == "S072":
     for product_type in product_types():
-        for position, sensor in S072_SENSOR_BY_POSITION.items():
-            params = {"product_type": product_type, "position": position}
-            emit("submit_place_to_s072", params, "S072", "place", position, sensor, product_type)
-            emit("submit_pick_from_s072", params, "S072", "pick", position, sensor, product_type)
+        params = {"product_type": product_type}
+        emit("submit_place_to_s072", params, "S072", "place", product_type=product_type)
+        emit("submit_pick_from_s072", params, "S072", "pick", product_type=product_type)
 elif station == "S08":
     for product_type in product_types():
         for position, sensor in S08_CAP_STATION_SENSOR_BY_POSITION.items():
@@ -534,7 +531,6 @@ CSV: $CSV_PATH
 MODE: $MODE
 IGNORE_OPCUA_TOKEN_TIME_DRIFT: $IGNORE_OPCUA_TOKEN_TIME_DRIFT
 CLEAR_PC_TO_PLC_BEFORE_RUN: $CLEAR_PC_TO_PLC_BEFORE_RUN
-SKIP_SENSOR_PRECHECK: $SKIP_SENSOR_PRECHECK
 SKIP_ROBOT_HANDSHAKE_CHECK: $SKIP_ROBOT_HANDSHAKE_CHECK
 SKIP_RESET_AFTER_RUN: $SKIP_RESET_AFTER_RUN
 

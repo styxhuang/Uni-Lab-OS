@@ -13,7 +13,7 @@ Task API：
 
 ```bash
 cd task-orchestration
-PYTHONPATH=src python -m uvicorn task_orchestration.main:app \
+PYTHONPATH=src:.. python -m uvicorn task_orchestration.main:app \
   --host 127.0.0.1 \
   --port 8091
 ```
@@ -40,8 +40,9 @@ Vite 就绪后打开 `http://127.0.0.1:5174/`。Vite 将 `/api` 代理到
 ### 网页操作顺序
 
 1. 在流程画布点击“切换 Task 模板编辑”，拖拽框选节点后右键“设为 Task 模板”。
-   系统不会按 SZLab 工位或工艺自动切分；新模板的 `resources`、输入条件和输出条件
-   默认均为空，创建模板无需先连接 OPC。
+   系统不会按 SZLab 工位或工艺自动切分。Task API 会依据权威 workflow 节点和
+   Registry `ActionContract` 自动编译并持久化节点契约；客户端不提交手写输入/输出
+   Trigger，创建模板也无需先连接 OPC。
 2. 仓库 sidecar 已将 S07、S06 两个示例模板预排到 Resource Schedule。自建模板仍需
    拖入“待排模板”；生成器只使用该区域中的模板，未拖入的模板不会进入 OPC 配置。
    Resource Schedule 中由节点汇总的设备信息只用于展示，不表示设备占用或互斥。
@@ -79,13 +80,15 @@ Vite 就绪后打开 `http://127.0.0.1:5174/`。Vite 将 `/api` 代理到
   多个 Action 请求允许并发进入设备 Action。
 - 设备可用性、OPC 握手及必要的串行保护由 Action 内部负责；独立 Action 可以保留自身
   的内部锁。
-- `Template.resources` 与顶层 `dynamic_resource_leases` 是旧 sidecar/API 的废弃兼容
-  字段，不参与候选选择、Action claim 或排程互斥。
-- input/output trigger 是可选的用户流程级条件。store 读取旧 sidecar 时只会丢弃已废弃
-  的单数 `Template.trigger`；契约内合法的 `input_triggers`/`output_triggers` 会继续
-  保留，升级时不会自动删除，确认不再需要后可在模板编辑区手动清除。
+- `Template.resources`、`input_triggers`、`output_triggers` 已从模板 schema 删除；
+  包含这些字段或缺少完整编译字段的旧 sidecar 会显式判坏，不做静默迁移。
+- `resource_requirements` 是 Action 物理资源的稳定去重汇总，目前仅作为编译和持久化
+  产物，不参与候选选择、Action claim 或排程互斥。顶层 `dynamic_resource_leases`
+  仍是旧运行状态兼容字段，不代表 Task 3 新增了资源租约。
+- `admission_gates` 是按节点顺序完成因果消解后的外部前置条件汇总。本阶段不读取该字段
+  执行运行时准入；快照判定和调度接线由后续任务实现。
 - OPC profile 根据已排模板所含 workflow 节点及其 Action `opc_variables` 生成。模板
-  条件可以为空，不是生成 profile 或派发 Action 的前置要求。
+  编译契约不是生成 profile 或派发 Action 的运行时门控。
 
 ### Schema v2
 
@@ -140,7 +143,7 @@ python -m scripts.szlab_task_opc_simulator \
 
 - `POST /api/opc-simulator/profiles:generate`：根据 `workflow`、
   `scheduled_template_ids` 与节点 Action 变量目录生成 draft；`templates` 用于确定
-  已排节点范围，模板条件不是必填输入。
+  已排节点范围；模板编译产物不是 profile 生成接口的手写条件输入。
 - `POST /api/opc-simulator/profiles:validate`：校验 `{profile, file_name}`，返回规范化
   profile 和 `validation_errors` 路径。
 - `PUT /api/opc-simulator/profiles/{file_name}`：保存 `{profile}`。覆盖已有文件必须
@@ -195,12 +198,14 @@ npm --prefix unilabos_local_ui run build
 
 提交前请确认并一次性 stage 本次 Task 调度相关文件，避免只提交 index 中的旧版本。
 
-## Trigger DTO
+## Template ActionContract 编译产物
 
-- CSV OPC 条件：`{"kind":"opc","config":{"plc_device_id":"szlab_poly_plc","variable":"变量名","value":<类型化值>}}`。
-  默认网关向 `/api/v1/opc/snapshots` 写入相同 `plc_device_id: "szlab_poly_plc"` 的快照；
-  `test_default_provider_snapshot_starts_frontend_mapped_opc_trigger` 覆盖该路径。
-- 当前持久化 Trigger 仅接受 `kind: "opc"`。资源、工位、internal 及旧
-  `opc_condition` DTO 均不属于当前契约，会以 422 拒绝。
-- input trigger 只在 Task 进入运行前判定；output trigger 保留为流程级输出描述，
-  不负责判定 Action 完成。设备就绪和完成握手由 Action 自身处理。
+- 创建或更新模板时，Task API 按有序 `node_ids` 读取服务端 workflow 节点，并从
+  Runtime/AST Registry 获取对应 Action schema；客户端不能提交解析后的 gates 作为权威。
+- `node_contracts[]` 与 `node_ids` 必须一一对应且顺序、ID 完全一致，保存每个节点已解析的
+  `preconditions`、`effects`、`resources`。明确无契约的非 S12 Action 由编译器写入
+  `contract_state: "empty"`；反序列化不会自动补齐缺失节点。
+- `admission_gates` 保存无法由前序 effect 建立的外部条件，
+  `resource_requirements` 保存稳定去重后的物理资源 ID。
+- 上述字段在 Task 3 中仅用于编译和持久化。当前调度不会判定 `admission_gates`，
+  也不会据 `resource_requirements` 创建租约；运行时准入与资源接线属于后续任务。

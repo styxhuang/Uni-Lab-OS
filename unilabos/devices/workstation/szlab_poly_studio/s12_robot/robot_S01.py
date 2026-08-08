@@ -26,5 +26,4 @@ class SzlabRobotS01Mixin:
             reset_variables={"S01出入料产品": 0, "S01取放料编号": 0, "任务号": 0},
             product_type=int(product_type),
             position=position,
-            sensor_check_skipped_reason="S01 暂无物料传感器",
         )

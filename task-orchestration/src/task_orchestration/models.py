@@ -31,38 +31,61 @@ class StrictModel(BaseModel):
         return type(self).model_validate(data)
 
 
-class Trigger(StrictModel):
-    """由已注册 PLC 变量判定的 Task 条件。"""
+class ContractCondition(StrictModel):
+    """已解析为具体变量和值的 Action 前置条件。"""
 
-    kind: Literal["opc"]
-    config: dict[str, Any]
+    source: Literal["opc", "occupancy"]
+    variable: str = Field(min_length=1)
+    operator: Literal["eq"]
+    expected: JsonValue
 
-    @model_validator(mode="after")
-    def validate_plc_variable_condition(self) -> Trigger:
-        """拒绝旧触发器及未绑定 PLC 注册变量的 OPC 条件。"""
-        required = ("plc_device_id", "variable", "value")
-        missing = [
-            key
-            for key in required
-            if key not in self.config or self.config[key] == ""
-        ]
-        if missing:
-            raise ValueError(
-                f"OPC trigger missing required fields: {', '.join(missing)}"
-            )
-        return self
+
+class ContractEffect(StrictModel):
+    """已解析为具体变量和值的 Action 成功效果。"""
+
+    source: Literal["opc", "occupancy"]
+    variable: str = Field(min_length=1)
+    expected: JsonValue
+
+
+class NodeContract(StrictModel):
+    """模板中单个 workflow 节点的已解析契约。"""
+
+    node_id: str = Field(min_length=1)
+    contract_state: Literal["resolved", "empty"]
+    preconditions: list[ContractCondition]
+    effects: list[ContractEffect]
+    resources: list[str]
 
 
 class Template(StrictModel):
-    """由 workflow 节点集合派生的可复用 Task 模板。"""
+    """由 workflow 节点集合及权威 Action schema 编译的 Task 模板。"""
 
+    schema_version: Literal[2] = 2
     id: str
     name: str
     workflow_path: str = ""
     node_ids: list[str] = Field(default_factory=list)
-    resources: list[str] = Field(default_factory=list)
-    input_triggers: list[Trigger] = Field(default_factory=list)
-    output_triggers: list[Trigger] = Field(default_factory=list)
+    node_contracts: list[NodeContract] = Field(default_factory=list)
+    admission_gates: list[ContractCondition] = Field(default_factory=list)
+    resource_requirements: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_compiled_nodes(self) -> Template:
+        """节点契约必须与有序 node_ids 一一对应。"""
+        if [item.node_id for item in self.node_contracts] != self.node_ids:
+            raise ValueError("node_contracts 必须与 node_ids 顺序一致")
+        if len(self.node_ids) != len(set(self.node_ids)):
+            raise ValueError("node_ids 不得重复")
+        return self
+
+
+class TemplateDraft(StrictModel):
+    """客户端可提交的模板草稿；编译产物只能由服务端生成。"""
+
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    node_ids: list[str]
 
 
 class NodeExecutionRecord(StrictModel):
@@ -538,15 +561,14 @@ class OpcSnapshotRequest(StrictModel):
 class TemplateCreateRequest(StrictModel):
     workflow_path: str
     expected_version: int = Field(ge=0)
-    template: Template
+    template: TemplateDraft
 
 
 class TemplateUpdateRequest(StrictModel):
     workflow_path: str
     expected_version: int = Field(ge=0)
     name: str | None = None
-    input_triggers: list[Trigger] | None = None
-    output_triggers: list[Trigger] | None = None
+    node_ids: list[str] | None = None
 
 
 class GenerateInstancesRequest(StrictModel):
@@ -684,13 +706,6 @@ class WaitingReason(StrictModel):
     code: str
     context: dict[str, Any] = Field(default_factory=dict)
     message: str | None = None
-
-
-class ConditionResult(StrictModel):
-    """单个条件的判定结果及结构化等待原因。"""
-
-    satisfied: bool
-    reason: WaitingReason | None = None
 
 
 class SchedulingResult(StrictModel):

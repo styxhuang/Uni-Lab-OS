@@ -11,4 +11,4 @@ def test_pytest_configuration_adds_src_to_import_path():
 
     config = tomllib.loads(pyproject.read_text(encoding="utf-8"))
 
-    assert config["tool"]["pytest"]["ini_options"]["pythonpath"] == ["src"]
+    assert config["tool"]["pytest"]["ini_options"]["pythonpath"] == ["src", ".."]

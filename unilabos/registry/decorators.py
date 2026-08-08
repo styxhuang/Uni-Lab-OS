@@ -48,9 +48,11 @@ Usage:
 from enum import Enum
 from functools import wraps
 import re
-from typing import Any, Callable, Dict, List, Optional, TypeVar
+from typing import Any, Callable, Dict, List, Literal, Optional, TypeAlias, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
+
+from unilabos.registry.ast_types import ASTCall
 
 F = TypeVar("F", bound=Callable[..., Any])
 _DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
@@ -81,6 +83,151 @@ class NodeType(str, Enum):
 
     ILAB = "ILab"
     MANUAL_CONFIRM = "manual_confirm"
+
+
+# ---------------------------------------------------------------------------
+# Action 契约
+# ---------------------------------------------------------------------------
+
+class _ActionContractModel(BaseModel):
+    """Action 契约模型基类：禁止未声明字段和隐式类型转换。"""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        frozen=True,
+        allow_inf_nan=False,
+    )
+
+
+class ParameterBinding(_ActionContractModel):
+    """解析器参数与 Action 入参之间的安全绑定。"""
+
+    kind: Literal["parameter"] = "parameter"
+    parameter: str = Field(min_length=1, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    path: List[str | int] = Field(default_factory=list)
+
+
+class ConstantBinding(_ActionContractModel):
+    """解析器参数使用的 JSON 常量绑定。"""
+
+    kind: Literal["constant"] = "constant"
+    value: JsonValue
+
+
+ResolverBinding: TypeAlias = ParameterBinding | ConstantBinding
+
+
+class ParameterResolver(_ActionContractModel):
+    """由消费端白名单解析器处理的多参数声明式引用。"""
+
+    kind: Literal["resolver"] = "resolver"
+    resolver_id: str = Field(
+        min_length=1,
+        pattern=r"^[A-Za-z_][A-Za-z0-9_.:-]*$",
+    )
+    arguments: Dict[str, ResolverBinding] = Field(default_factory=dict)
+
+
+ContractValue: TypeAlias = JsonValue | ParameterBinding | ParameterResolver
+DynamicIdentifier: TypeAlias = str | ParameterBinding | ParameterResolver
+
+
+def _parse_contract_reference(value: Any) -> Any:
+    """优先将引用字典解析为对应的声明式模型。"""
+    if isinstance(value, dict) and value.get("kind") == "resolver":
+        return ParameterResolver.model_validate(value)
+    if isinstance(value, dict) and value.get("kind") == "parameter":
+        return ParameterBinding.model_validate(value)
+    return value
+
+
+class OPCCondition(_ActionContractModel):
+    """执行 Action 前需要满足的实体 OPC 或逻辑占用条件。"""
+
+    source: Literal["opc", "occupancy"] = "opc"
+    variable: DynamicIdentifier
+    operator: str = Field(default="eq", pattern=r"^eq$")
+    expected: ContractValue
+
+    _validate_expected = field_validator("expected", mode="before")(
+        _parse_contract_reference
+    )
+
+
+class ActionEffect(_ActionContractModel):
+    """Action 成功后应达到的状态。"""
+
+    source: Literal["opc", "occupancy"] = "opc"
+    variable: DynamicIdentifier
+    expected: ContractValue
+
+    _validate_expected = field_validator("expected", mode="before")(
+        _parse_contract_reference
+    )
+
+
+class PhysicalResource(_ActionContractModel):
+    """Action 占用或操作的物理资源。"""
+
+    resource_id: DynamicIdentifier
+
+
+class ActionContract(_ActionContractModel):
+    """供 Registry 和 Task 编译器消费的声明式 Action 契约。"""
+
+    opc_conditions: List[OPCCondition] = Field(default_factory=list)
+    effects: List[ActionEffect] = Field(default_factory=list)
+    physical_resources: List[PhysicalResource] = Field(default_factory=list)
+
+
+_ACTION_CONTRACT_CALLS = frozenset(
+    {
+        "ActionContract",
+        "ActionEffect",
+        "ConstantBinding",
+        "OPCCondition",
+        "ParameterBinding",
+        "ParameterResolver",
+        "PhysicalResource",
+    }
+)
+
+
+def _normalize_contract_ast_value(value: Any) -> Any:
+    """将 AST 构造器字典转为普通数据，并拒绝任意函数调用。"""
+    if isinstance(value, list):
+        return [_normalize_contract_ast_value(item) for item in value]
+    if isinstance(value, ASTCall):
+        call_name = value.target.replace(":", ".").rsplit(".", 1)[-1]
+        if call_name not in _ACTION_CONTRACT_CALLS:
+            raise ValueError(f"Action contract 不允许调用 '{value.target}'")
+        normalized_values = _normalize_contract_ast_value(value.values)
+        reference_kinds = {
+            "ParameterBinding": "parameter",
+            "ConstantBinding": "constant",
+            "ParameterResolver": "resolver",
+        }
+        if call_name in reference_kinds:
+            normalized_values.setdefault("kind", reference_kinds[call_name])
+        return normalized_values
+    if not isinstance(value, dict):
+        return value
+    return {
+        key: _normalize_contract_ast_value(item)
+        for key, item in value.items()
+    }
+
+
+def normalize_action_contract(contract: Any) -> Optional[Dict[str, Any]]:
+    """严格校验并导出 JSON 可序列化的 Action 契约。"""
+    if contract is None:
+        return None
+    if isinstance(contract, ActionContract):
+        model = contract
+    else:
+        model = ActionContract.model_validate(_normalize_contract_ast_value(contract))
+    return model.model_dump(mode="json")
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +504,7 @@ def action(
     parent: bool = False,
     node_type: Optional["NodeType"] = None,
     feedback_interval: Optional[float] = None,
+    contract: Optional[ActionContract] = None,
 ):
     """
     动作方法装饰器
@@ -389,6 +537,7 @@ def action(
         parent: 若为 True，当方法参数为空 (*args, **kwargs) 时，通过 MRO 从父类获取真实方法参数
         node_type: 动作的节点类型 (NodeType.ILAB / NodeType.MANUAL_CONFIRM)。
                    不填写时不写入注册表。
+        contract: 声明式 Action 契约；未声明时导出为 None。
     """
 
     def decorator(func: F) -> F:
@@ -419,6 +568,7 @@ def action(
             "description": description,
             "auto_prefix": auto_prefix,
             "parent": parent,
+            "contract": normalize_action_contract(contract),
         }
         if feedback_interval is not None:
             meta["feedback_interval"] = feedback_interval

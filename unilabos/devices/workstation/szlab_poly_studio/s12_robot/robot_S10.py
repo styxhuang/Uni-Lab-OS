@@ -14,7 +14,6 @@ class SzlabRobotS10Mixin:
             task_number=21,
             variables=build_variables("place_to_s10", S10取放料编号=position),
             reset_variables={"S10取放料编号": 0, "任务号": 0},
-            precheck=lambda: self._ensure_sensor_gate(sensor, False, "S10 放试剂瓶目标位必须为空"),
             position=int(position),
             target_sensor_variable=sensor,
         )
@@ -27,7 +26,6 @@ class SzlabRobotS10Mixin:
             task_number=22,
             variables=build_variables("pick_from_s10", S10取放料编号=position),
             reset_variables={"S10取放料编号": 0, "任务号": 0},
-            precheck=lambda: self._ensure_sensor_gate(sensor, True, "S10 取试剂瓶源位必须有试剂瓶"),
             position=int(position),
             source_sensor_variable=sensor,
         )

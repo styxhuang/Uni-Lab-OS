@@ -7,12 +7,17 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from .action_catalog import ActionCatalog, AstRegistryActionCatalog
 from .api.router import create_router
 from .service import WorkspaceService
 from .store import WorkspaceStore
 
 
-def create_app(workspace_root: Path | str | None = None) -> FastAPI:
+def create_app(
+    workspace_root: Path | str | None = None,
+    *,
+    action_catalog: ActionCatalog | None = None,
+) -> FastAPI:
     """创建服务应用，workspace_root 限定可读写的 workflow 目录。"""
     app = FastAPI(
         title="task-orchestration",
@@ -31,7 +36,13 @@ def create_app(workspace_root: Path | str | None = None) -> FastAPI:
         allow_headers=["Content-Type"],
     )
     store = WorkspaceStore(workspace_root or Path.cwd())
-    router = create_router(store, WorkspaceService(store))
+    catalog = action_catalog or AstRegistryActionCatalog(
+        Path(__file__).resolve().parents[3]
+    )
+    router = create_router(
+        store,
+        WorkspaceService(store, action_catalog=catalog),
+    )
     app.include_router(router)
     app.include_router(router, prefix="/api/v1")
     return app

@@ -604,7 +604,7 @@ def test_default_profile_has_real_workflow_metadata():
             ("szlab-e2e-s07",),
             "szlab_mixer_robot",
             "submit_place_to_s072",
-            {"product_type": 1, "position": 1},
+            {"product_type": 1},
         ),
         (
             "node_003_dose_powder",
@@ -624,7 +624,7 @@ def test_default_profile_has_real_workflow_metadata():
             ("szlab-e2e-s06",),
             "szlab_mixer_robot",
             "submit_pick_from_s072",
-            {"product_type": 1, "position": 1},
+            {"product_type": 1},
         ),
         (
             "node_005_place_to_s06",

@@ -19,18 +19,19 @@ from task_orchestration.models import (
     PlcRegistration,
     TaskScheduleEntry,
     Template,
-    Trigger,
     Workspace,
 )
 from task_orchestration.service import WorkspaceService, WorkspaceServiceError
 from task_orchestration.store import VersionConflictError, WorkspaceStore
 
 
-def test_readme_opc_trigger_uses_runtime_plc_device_id():
+def test_readme_describes_compilation_only_template_contract():
     readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
 
-    assert '"provider_id"' not in readme
-    assert '"plc_device_id":"szlab_poly_plc"' in readme
+    assert "Template ActionContract 编译产物" in readme
+    assert "`node_contracts[]` 与 `node_ids` 必须一一对应" in readme
+    assert "当前调度不会判定 `admission_gates`" in readme
+    assert "## Trigger DTO" not in readme
 
 
 def test_health_reports_service_status(tmp_path):
@@ -47,8 +48,7 @@ def test_local_api_mutations_ignore_legacy_bearer_token_configuration(tmp_path, 
     monkeypatch.setenv("TASK_ORCHESTRATION_UI_TOKEN", "ui-secret")
     monkeypatch.setenv("TASK_ORCHESTRATION_GATEWAY_TOKEN", "gateway-secret")
     monkeypatch.setenv("TASK_ORCHESTRATION_ADMIN_TOKEN", "admin-secret")
-    (tmp_path / "demo.json").write_text("{}", encoding="utf-8")
-    client = RawTestClient(create_app(tmp_path))
+    client = _client_with_workflow(tmp_path)
 
     workspace = client.put("/workspaces", json={
         "expected_version": 0,
@@ -241,16 +241,12 @@ def test_opc_snapshot_rejects_oversized_declared_body(tmp_path, monkeypatch):
 def test_opc_snapshot_persists_raw_values_for_task_observability(tmp_path, monkeypatch):
     monkeypatch.setenv("TASK_ORCHESTRATION_GATEWAY_TOKEN", "gateway-secret")
     client = _client_with_workflow(tmp_path)
-    trigger = {
-        "kind": "opc",
-        "config": {"plc_device_id": "line", "variable": "ready", "value": True},
-    }
     assert client.post(
         "/templates",
         json={
             "workflow_path": "demo.json",
             "expected_version": 0,
-            "template": _template("task", input_triggers=[trigger]),
+            "template": _template("task"),
         },
     ).status_code == 200
     assert client.post(
@@ -338,7 +334,7 @@ def test_corrupt_sidecar_returns_stable_validation_error(tmp_path, contents):
     assert response.json() == {"detail": "invalid task workspace sidecar"}
 
 
-def test_store_load_migrates_legacy_sidecar_but_put_remains_strict(tmp_path):
+def test_store_load_rejects_legacy_sidecar_without_migration(tmp_path):
     (tmp_path / "demo.json").write_text("{}", encoding="utf-8")
     legacy_workspace = {
         "workflow_path": "demo.json",
@@ -362,36 +358,9 @@ def test_store_load_migrates_legacy_sidecar_but_put_remains_strict(tmp_path):
     client = TestClient(create_app(tmp_path))
 
     loaded = client.get("/workspaces", params={"workflow_path": "demo.json"})
-    assert loaded.status_code == 200
-    template = loaded.json()["workspace"]["templates"][0]
-    instance = loaded.json()["workspace"]["task_instances"][0]
-    assert "trigger" not in template
-    assert instance["execution_state"]["cursor"] == 2
-    assert instance["execution_state"]["active_execution_id"] is None
+    assert loaded.status_code == 422
+    assert loaded.json() == {"detail": "invalid task workspace sidecar"}
     assert sidecar.read_text(encoding="utf-8") == original
-
-    rejected_trigger = client.put(
-        "/workspaces",
-        json={"expected_version": 4, "workspace": legacy_workspace},
-    )
-    assert rejected_trigger.status_code == 422
-    explicit_empty_state = {
-        **legacy_workspace,
-        "templates": [{
-            key: value
-            for key, value in legacy_workspace["templates"][0].items()
-            if key != "trigger"
-        }],
-        "task_instances": [{
-            **legacy_workspace["task_instances"][0],
-            "execution_state": {},
-        }],
-    }
-    rejected_state = client.put(
-        "/workspaces",
-        json={"expected_version": 4, "workspace": explicit_empty_state},
-    )
-    assert rejected_state.status_code == 422
 
 
 def test_reset_workspace_removes_only_current_workflow_sidecar(tmp_path):
@@ -542,7 +511,34 @@ def test_put_rejects_invalid_instance_lifecycle_and_plan_returns_422_for_sidecar
 
 
 def _client_with_workflow(tmp_path) -> TestClient:
-    (tmp_path / "demo.json").write_text("{}", encoding="utf-8")
+    node_ids = [
+        f"{template_id}-node"
+        for template_id in (
+            "task", "prepare", "manual", "csv-opc", "legacy", "reserved",
+            "opc-task", "robot", "station", "sample-first", "sample-second",
+            "running", "done", "shared", "empty", "plc-task", "first",
+            "second",
+        )
+    ] + [
+        "s06-action", "s07-action", "node", "measure-node", "pipeline-node",
+        "other-node", "robot-action", "other-action", "created-node",
+        "ungated-node",
+    ]
+    workflow = {
+        "rules": [{
+            "actions": [{
+                "action": {
+                    "workflow_node_id": node_id,
+                    "device_id": "test_device",
+                    "method": "run",
+                    "params": {},
+                }
+            } for node_id in node_ids]
+        }]
+    }
+    (tmp_path / "demo.json").write_text(
+        json.dumps(workflow), encoding="utf-8"
+    )
     (tmp_path / "demo.json.task-workspace.json").write_text(
         json.dumps({
             "version": 0,
@@ -573,28 +569,70 @@ def _client_with_workflow(tmp_path) -> TestClient:
         }),
         encoding="utf-8",
     )
-    return TestClient(create_app(tmp_path))
+
+    class EmptyContractCatalog:
+        def action_contract(self, device_id, method):
+            return (device_id, method) == ("test_device", "run"), None
+
+    return TestClient(create_app(tmp_path, action_catalog=EmptyContractCatalog()))
+
+
+def _empty_contract(node_id: str) -> dict:
+    return {
+        "node_id": node_id,
+        "contract_state": "empty",
+        "preconditions": [],
+        "effects": [],
+        "resources": [],
+    }
 
 
 def _template(
     template_id: str,
     *,
     resources: list[str] | None = None,
-    input_triggers: list[dict] | None = None,
-    output_triggers: list[dict] | None = None,
+    compiled: bool = False,
 ):
-    default_trigger = {
-        "kind": "opc",
-        "config": {"plc_device_id": "line", "variable": "ready", "value": True},
-    }
-    return {
+    node_ids = [f"{template_id}-node"]
+    result = {
         "id": template_id,
         "name": template_id,
-        "node_ids": [f"{template_id}-node"],
-        "resources": resources or [],
-        "input_triggers": [default_trigger] if input_triggers is None else input_triggers,
-        "output_triggers": [default_trigger] if output_triggers is None else output_triggers,
+        "node_ids": node_ids,
     }
+    if compiled:
+        result.update(
+            {
+                "schema_version": 2,
+                "node_contracts": [
+                    _empty_contract(node_id)
+                    for node_id in node_ids
+                ],
+                "admission_gates": [],
+                "resource_requirements": resources or [],
+            }
+        )
+    return result
+
+
+def _seed_workspace(tmp_path, workspace: dict) -> None:
+    """测试夹具绕过公开 API，模板仍由各行为测试自行构造。"""
+    workspace = json.loads(json.dumps(workspace))
+    for template in workspace.get("templates", []):
+        node_ids = template.get("node_ids", [])
+        template.setdefault("schema_version", 2)
+        template.setdefault(
+            "node_contracts",
+            [
+                _empty_contract(node_id)
+                for node_id in node_ids
+            ],
+        )
+        template.setdefault("admission_gates", [])
+        template.setdefault("resource_requirements", [])
+    WorkspaceStore(tmp_path).put(
+        Workspace.model_validate(workspace),
+        expected_version=0,
+    )
 
 
 def test_instance_parameter_overrides_are_saved_only_on_the_target_instance(tmp_path):
@@ -620,10 +658,7 @@ def test_instance_parameter_overrides_are_saved_only_on_the_target_instance(tmp_
             },
         ],
     }
-    assert client.put(
-        "/workspaces",
-        json={"expected_version": 0, "workspace": workspace},
-    ).status_code == 200
+    _seed_workspace(tmp_path, workspace)
 
     response = client.patch(
         "/instances/sample-a-prepare/parameters",
@@ -670,10 +705,7 @@ def test_instance_parameter_overrides_reject_running_instances(tmp_path):
             },
         }],
     }
-    assert client.put(
-        "/workspaces",
-        json={"expected_version": 0, "workspace": workspace},
-    ).status_code == 200
+    _seed_workspace(tmp_path, workspace)
 
     response = client.patch(
         "/instances/sample-a-prepare/parameters",
@@ -1032,100 +1064,6 @@ def test_generation_and_move_preserve_per_sample_sequence(tmp_path):
     assert forbidden.json()["detail"]["code"] == "instance_not_reorderable"
 
 
-def test_opc_plan_and_advance_defer_resource_locks_to_action_claim(tmp_path, monkeypatch):
-    monkeypatch.setenv("TASK_ORCHESTRATION_GATEWAY_TOKEN", "gateway-secret")
-    client = _client_with_workflow(tmp_path)
-    opc_trigger = {
-        "kind": "opc",
-        "config": {"plc_device_id": "line-1", "variable": "ready", "value": True},
-    }
-    for version, template_id in enumerate(("robot-a", "robot-b")):
-        assert client.post(
-            "/templates",
-            json={
-                "workflow_path": "demo.json",
-                "expected_version": version,
-                "template": {
-                    **_template(
-                        template_id, resources=["robot"], input_triggers=[opc_trigger]
-                    ),
-                    "node_ids": [],
-                },
-            },
-        ).status_code == 200
-    generated = client.post(
-        "/instances:generate",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 2,
-            "template_ids": ["robot-a"],
-            "sample_ids": ["sample-a", "sample-b"],
-        },
-    )
-    assert generated.status_code == 200
-    first_id, second_id = [
-        item["id"] for item in generated.json()["workspace"]["task_instances"]
-    ]
-
-    waiting = client.post(
-        "/schedule:plan",
-        json={"workflow_path": "demo.json", "expected_version": 3},
-    )
-    assert waiting.status_code == 200
-    assert waiting.json()["schedule"]["waiting_reasons"][first_id]["code"] == "opc_variable_missing"
-
-    pushed = client.post(
-        "/opc/snapshots",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 4,
-            "plc_device_id": "line-1",
-            "sequence": 1,
-            "values": {"ready": True},
-        },
-        headers={"Authorization": "Bearer gateway-secret"},
-    )
-    assert pushed.status_code == 200
-
-    planned = client.post(
-        "/schedule:plan",
-        json={"workflow_path": "demo.json", "expected_version": 5},
-    )
-    assert planned.status_code == 200
-    assert planned.json()["schedule"]["startable_instance_ids"] == [first_id, second_id]
-    assert second_id not in planned.json()["schedule"]["waiting_reasons"]
-
-    advanced = client.post(
-        "/schedule:advance",
-        json={"workflow_path": "demo.json", "expected_version": 6},
-    )
-    assert advanced.status_code == 200
-    assert {item["id"]: item["status"] for item in advanced.json()["workspace"]["task_instances"]} == {
-        first_id: "running",
-        second_id: "running",
-    }
-    scheduled_event = next(
-        event for event in advanced.json()["workspace"]["events"]
-        if event["kind"] == "scheduled" and event["instance_id"] == first_id
-    )
-    assert scheduled_event["payload"]["satisfied_triggers"] == [opc_trigger]
-
-    completed = client.post(
-        "/schedule:advance",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 7,
-            "completed_instance_ids": [first_id],
-        },
-    )
-    assert completed.status_code == 200
-    completed_body = completed.json()
-    assert {item["id"]: item["status"] for item in completed_body["workspace"]["task_instances"]} == {
-        first_id: "completed",
-        second_id: "completed",
-    }
-
-
 def test_paused_scheduler_does_not_dispatch(tmp_path):
     client = _client_with_workflow(tmp_path)
     assert client.post(
@@ -1157,59 +1095,6 @@ def test_paused_scheduler_does_not_dispatch(tmp_path):
     )
     assert dispatched.status_code == 200
     assert dispatched.json()["workspace"]["task_instances"][0]["status"] == "pending"
-
-
-def test_default_provider_snapshot_starts_frontend_mapped_opc_trigger(tmp_path, monkeypatch):
-    monkeypatch.setenv("TASK_ORCHESTRATION_GATEWAY_TOKEN", "gateway-secret")
-    client = _client_with_workflow(tmp_path)
-    assert client.post(
-        "/templates",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 0,
-            "template": {
-                **_template("csv-opc"),
-                "input_triggers": [{
-                    "kind": "opc",
-                    "config": {
-                        "plc_device_id": "default",
-                        "variable": "S09 空闲",
-                        "value": True,
-                    },
-                }],
-            },
-        },
-    ).status_code == 200
-    generated = client.post(
-        "/instances:generate",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 1,
-            "template_ids": ["csv-opc"],
-            "sample_ids": ["sample-a"],
-        },
-    )
-    instance_id = generated.json()["workspace"]["task_instances"][0]["id"]
-    assert client.post(
-        "/opc/snapshots",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 2,
-            "plc_device_id": "default",
-            "sequence": 1,
-            "values": {"S09 空闲": True},
-        },
-        headers={"Authorization": "Bearer gateway-secret"},
-    ).status_code == 200
-
-    started = client.post(
-        "/schedule:advance",
-        json={"workflow_path": "demo.json", "expected_version": 3},
-    )
-
-    assert started.status_code == 200
-    assert started.json()["workspace"]["task_instances"][0]["id"] == instance_id
-    assert started.json()["workspace"]["task_instances"][0]["status"] == "running"
 
 
 @pytest.mark.parametrize("kind,config", [
@@ -1247,7 +1132,7 @@ def test_template_resources_ignore_legacy_policy_namespaces(tmp_path, resource):
     )
 
     assert response.status_code == 200
-    assert response.json()["workspace"]["templates"][0]["resources"] == []
+    assert response.json()["workspace"]["templates"][0]["resource_requirements"] == []
 
 
 def test_legacy_opc_condition_trigger_is_rejected_with_validation_error(tmp_path):
@@ -1273,7 +1158,8 @@ def test_legacy_opc_condition_trigger_is_rejected_with_validation_error(tmp_path
     )
 
     assert response.status_code == 422
-    assert "Input should be 'opc'" in response.text
+    assert "input_triggers" in response.text
+    assert "Extra inputs are not permitted" in response.text
 
 
 def test_plan_and_advance_do_not_overwrite_scheduled_template_configuration(tmp_path):
@@ -1318,124 +1204,15 @@ def test_plan_and_advance_do_not_overwrite_scheduled_template_configuration(tmp_
     assert advanced.json()["workspace"]["schedule_entries"][0]["resources"] == []
 
 
-def test_plc_output_trigger_is_informational_and_does_not_block_completion(tmp_path, monkeypatch):
-    monkeypatch.setenv("TASK_ORCHESTRATION_GATEWAY_TOKEN", "gateway-secret")
-    client = _client_with_workflow(tmp_path)
-    input_condition = {
-        "kind": "opc",
-        "config": {"plc_device_id": "plc-a", "variable": "ready", "value": True},
-    }
-    output_condition = {
-        "kind": "opc",
-        "config": {"plc_device_id": "plc-a", "variable": "done", "value": True},
-    }
-    assert client.post(
-        "/templates",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 0,
-            "template": {
-                **_template(
-                    "plc-task",
-                    input_triggers=[input_condition],
-                    output_triggers=[output_condition],
-                ),
-                "node_ids": [],
-            },
-        },
-    ).status_code == 200
-    instance_id = client.post(
-        "/instances:generate",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 1,
-            "template_ids": ["plc-task"],
-            "sample_ids": ["sample-a"],
-        },
-    ).json()["workspace"]["task_instances"][0]["id"]
-    headers = {"Authorization": "Bearer gateway-secret"}
-    assert client.post(
-        "/opc/snapshots",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 2,
-            "plc_device_id": "plc-a",
-            "sequence": 1,
-            "values": {"ready": True, "done": False},
-        },
-        headers=headers,
-    ).status_code == 200
-    started = client.post(
-        "/schedule:advance",
-        json={"workflow_path": "demo.json", "expected_version": 3},
-    )
-    assert started.json()["workspace"]["task_instances"][0]["status"] == "running"
-    completed = client.post(
-        "/schedule:advance",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 4,
-            "completed_instance_ids": [instance_id],
-        },
-    )
-    assert completed.json()["workspace"]["task_instances"][0]["status"] == "completed"
-    assert completed.json()["schedule"]["waiting_reasons"] == {}
-    assert completed.json()["workspace"]["templates"][0]["output_triggers"] == [
-        output_condition
-    ]
-
-
-def test_opc_version_conflict_does_not_leave_snapshot_for_future_plan(tmp_path, monkeypatch):
-    monkeypatch.setenv("TASK_ORCHESTRATION_GATEWAY_TOKEN", "gateway-secret")
-    client = _client_with_workflow(tmp_path)
-    trigger = {"kind": "opc", "config": {"plc_device_id": "line-1", "variable": "ready", "value": True}}
-    assert client.post(
-        "/templates",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 0,
-            "template": _template("opc-task", input_triggers=[trigger]),
-        },
-    ).status_code == 200
-    assert client.post(
-        "/instances:generate",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 1,
-            "template_ids": ["opc-task"],
-            "sample_ids": ["sample-a"],
-        },
-    ).status_code == 200
-
-    conflict = client.post(
-        "/opc/snapshots",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 0,
-            "plc_device_id": "line-1",
-            "sequence": 2,
-            "values": {"ready": True},
-        },
-        headers={"Authorization": "Bearer gateway-secret"},
-    )
-    assert conflict.status_code == 409
-    planned = client.post(
-        "/schedule:plan",
-        json={"workflow_path": "demo.json", "expected_version": 2},
-    )
-    assert planned.json()["schedule"]["waiting_reasons"]
-
-
 def test_opc_snapshot_uses_same_key_for_absolute_and_relative_workflow_paths(tmp_path, monkeypatch):
     monkeypatch.setenv("TASK_ORCHESTRATION_GATEWAY_TOKEN", "gateway-secret")
     client = _client_with_workflow(tmp_path)
-    trigger = {"kind": "opc", "config": {"plc_device_id": "line", "variable": "ready", "value": True}}
     assert client.post(
         "/templates",
         json={
             "workflow_path": "demo.json",
             "expected_version": 0,
-            "template": _template("opc-task", input_triggers=[trigger]),
+            "template": _template("opc-task"),
         },
     ).status_code == 200
     assert client.post(
@@ -1486,10 +1263,7 @@ def test_opc_write_failure_rolls_back_provider_snapshot(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="disk full"):
         service.push_opc_snapshot("demo.json", 1, "line", 1, {"ready": True})
 
-    assert not conditions.evaluate(
-        "demo.json",
-        Trigger(kind="opc", config={"plc_device_id": "line", "variable": "ready", "value": True}),
-    ).satisfied
+    assert conditions.export_state("demo.json", "line") is None
 
 
 def test_plan_persists_task_entries_for_samples_and_actual_times(tmp_path, monkeypatch):
@@ -1521,11 +1295,7 @@ def test_plan_persists_task_entries_for_samples_and_actual_times(tmp_path, monke
             ],
         },
     }
-    assert client.put(
-        "/workspaces",
-        json=payload,
-        headers={"Authorization": "Bearer admin-secret"},
-    ).status_code == 200
+    _seed_workspace(tmp_path, payload["workspace"])
 
     planned = client.post(
         "/schedule:plan",
@@ -1551,7 +1321,16 @@ def test_plan_persists_task_entries_for_samples_and_actual_times(tmp_path, monke
 def test_advance_records_injected_start_and_finish_times_in_schedule_entries(tmp_path):
     (tmp_path / "demo.json").write_text("{}", encoding="utf-8")
     now = [100]
-    service = WorkspaceService(WorkspaceStore(tmp_path), clock=lambda: now[0])
+    empty_catalog = type(
+        "EmptyCatalog",
+        (),
+        {"action_contract": lambda _self, _device_id, _method: (False, None)},
+    )()
+    service = WorkspaceService(
+        WorkspaceStore(tmp_path),
+        clock=lambda: now[0],
+        action_catalog=empty_catalog,
+    )
     service.register_plc_variables(
         "demo.json",
         0,
@@ -1561,19 +1340,14 @@ def test_advance_records_injected_start_and_finish_times_in_schedule_entries(tmp
             variables=["ready"],
         ),
     )
-    trigger = Trigger(
-        kind="opc",
-        config={"plc_device_id": "line", "variable": "ready", "value": True},
-    )
     service.create_template(
         "demo.json",
         1,
         Template(
+            schema_version=2,
             id="task",
             name="task",
             node_ids=[],
-            input_triggers=[trigger],
-            output_triggers=[trigger],
         ),
     )
     service.push_opc_snapshot("demo.json", 2, "line", 1, {"ready": True})
@@ -1594,95 +1368,6 @@ def test_advance_records_injected_start_and_finish_times_in_schedule_entries(tmp
     assert completed.workspace.schedule_entries[0].end_at == 250
 
 
-def test_sample_start_interval_delays_each_sample_and_rechecks_trigger(tmp_path):
-    (tmp_path / "demo.json").write_text("{}", encoding="utf-8")
-    now_ms = [1_000]
-    condition_now = [1.0]
-    conditions = OpcConditionProvider(
-        snapshot_ttl_seconds=30.0,
-        clock=lambda: condition_now[0],
-    )
-    store = WorkspaceStore(tmp_path)
-    trigger = Trigger(
-        kind="opc",
-        config={
-            "plc_device_id": "line",
-            "variable": "ready",
-            "value": True,
-        },
-    )
-    store.put(
-        Workspace(
-            workflow_path="demo.json",
-            templates=[
-                Template(
-                    id="task",
-                    name="task",
-                    node_ids=[],
-                    input_triggers=[trigger],
-                )
-            ],
-            plc_registrations=[
-                PlcRegistration(
-                    plc_device_id="line",
-                    runtime_url="opc.tcp://test:4840",
-                    variables=["ready"],
-                )
-            ],
-        ),
-        expected_version=0,
-    )
-    service = WorkspaceService(
-        store,
-        conditions=conditions,
-        clock=lambda: now_ms[0],
-    )
-    conditions.update("demo.json", "line", 1, {"ready": True})
-
-    generated = service.generate_instances(
-        "demo.json",
-        1,
-        ["task"],
-        ["Sample A", "Sample B"],
-        sample_start_interval_seconds=1.0,
-    )
-    instances = {
-        item.sample_id: item for item in generated.workspace.task_instances
-    }
-    entries = {
-        item.sample_id: item for item in generated.workspace.schedule_entries
-    }
-
-    assert instances["Sample A"].not_before == 1_000
-    assert instances["Sample B"].not_before == 2_000
-    assert entries["Sample A"].start_at == 1_000
-    assert entries["Sample B"].start_at == 2_000
-
-    started_a, _ = service.advance("demo.json", 2)
-    states = {
-        item.sample_id: item.status for item in started_a.workspace.task_instances
-    }
-    assert states == {"Sample A": "running", "Sample B": "waiting"}
-
-    now_ms[0] = 2_000
-    condition_now[0] = 2.0
-    conditions.update("demo.json", "line", 2, {"ready": False})
-    blocked_b, schedule = service.advance("demo.json", 3)
-    states = {
-        item.sample_id: item.status for item in blocked_b.workspace.task_instances
-    }
-    assert states == {"Sample A": "completed", "Sample B": "waiting"}
-    sample_b = instances["Sample B"]
-    assert schedule.waiting_reasons[sample_b.id].code == "opc_value_mismatch"
-
-    conditions.update("demo.json", "line", 3, {"ready": True})
-    started_b, _ = service.advance("demo.json", 4)
-    states = {
-        item.sample_id: item.status for item in started_b.workspace.task_instances
-    }
-    assert states == {"Sample A": "completed", "Sample B": "running"}
-
-
 def test_sample_start_interval_is_shared_by_templates_of_the_same_sample(tmp_path):
     (tmp_path / "demo.json").write_text("{}", encoding="utf-8")
     store = WorkspaceStore(tmp_path)
@@ -1690,8 +1375,22 @@ def test_sample_start_interval_is_shared_by_templates_of_the_same_sample(tmp_pat
         Workspace(
             workflow_path="demo.json",
             templates=[
-                Template(id="first", name="first", node_ids=["first-node"]),
-                Template(id="second", name="second", node_ids=["second-node"]),
+                Template(
+                    id="first",
+                    name="first",
+                    node_ids=["first-node"],
+                    node_contracts=[
+                        _empty_contract("first-node")
+                    ],
+                ),
+                Template(
+                    id="second",
+                    name="second",
+                    node_ids=["second-node"],
+                    node_contracts=[
+                        _empty_contract("second-node")
+                    ],
+                ),
             ],
         ),
         expected_version=0,
@@ -1734,6 +1433,9 @@ def test_running_gantt_entry_extends_through_current_time(tmp_path):
                     id="running-template",
                     name="running-template",
                     node_ids=["node"],
+                    node_contracts=[
+                        _empty_contract("node")
+                    ],
                 )
             ],
             task_instances=[{
@@ -1802,11 +1504,7 @@ def test_real_running_resource_interval_precedes_pending_gantt_entries(tmp_path,
             ],
         },
     }
-    assert client.put(
-        "/workspaces",
-        json=payload,
-        headers={"Authorization": "Bearer admin-secret"},
-    ).status_code == 200
+    _seed_workspace(tmp_path, payload["workspace"])
 
     planned = client.post(
         "/schedule:plan",
@@ -1828,228 +1526,6 @@ def test_schedule_entry_rejects_end_before_start():
             resources=[],
             state="planned",
         )
-
-
-def test_plc_registration_gates_template_conditions_and_runtime_url_change(tmp_path, monkeypatch):
-    """模板只能引用当前 PLC runtime 注册的变量，切换 URL 必须废弃旧快照。"""
-    monkeypatch.setenv("TASK_ORCHESTRATION_GATEWAY_TOKEN", "gateway-secret")
-    client = _client_with_workflow(tmp_path)
-    headers = {"Authorization": "Bearer gateway-secret"}
-    trigger = {
-        "kind": "opc",
-        "config": {"plc_device_id": "unregistered-plc", "variable": "ready", "value": True},
-    }
-    template = _template(
-        "registered-task",
-        input_triggers=[trigger],
-        output_triggers=[trigger],
-    )
-
-    unregistered = client.post(
-        "/templates",
-        json={"workflow_path": "demo.json", "expected_version": 0, "template": template},
-    )
-    assert unregistered.status_code == 409
-    assert unregistered.json()["detail"]["code"] == "unregistered_plc_variable"
-
-    empty_conditions = client.post(
-        "/templates",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 0,
-            "template": _template("empty", input_triggers=[], output_triggers=[]),
-        },
-    )
-    assert empty_conditions.status_code == 200
-
-    registered = client.post(
-        "/opc/registrations",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 0,
-            "registration": {
-                "plc_device_id": "unregistered-plc",
-                "runtime_url": "opc.tcp://first:4840",
-                "variables": ["ready"],
-            },
-        },
-        headers=headers,
-    )
-    assert registered.status_code == 200
-    created = client.post(
-        "/templates",
-        json={"workflow_path": "demo.json", "expected_version": 2, "template": template},
-    )
-    assert created.status_code == 200
-    snapshot = client.post(
-        "/opc/snapshots",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 3,
-            "plc_device_id": "unregistered-plc",
-            "sequence": 1,
-            "values": {"ready": True},
-        },
-        headers=headers,
-    )
-    assert snapshot.status_code == 200
-
-    changed = client.post(
-        "/opc/registrations",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 3,
-            "registration": {
-                "plc_device_id": "unregistered-plc",
-                "runtime_url": "opc.tcp://second:4840",
-                "variables": ["ready"],
-            },
-        },
-        headers=headers,
-    )
-    assert changed.status_code == 200
-    workspace = changed.json()["workspace"]
-    assert workspace["scheduler_paused"] is True
-    assert not [
-        item for item in workspace["opc_snapshots"]
-        if item["plc_device_id"] == "unregistered-plc"
-    ]
-    assert next(
-        item for item in workspace["plc_registrations"]
-        if item["plc_device_id"] == "unregistered-plc"
-    ) == {
-        "plc_device_id": "unregistered-plc",
-        "runtime_url": "opc.tcp://second:4840",
-        "variables": ["ready"],
-        "aliases": {},
-    }
-
-
-def test_template_update_rejects_empty_or_unregistered_conditions(tmp_path, monkeypatch):
-    monkeypatch.setenv("TASK_ORCHESTRATION_GATEWAY_TOKEN", "gateway-secret")
-    client = _client_with_workflow(tmp_path)
-    headers = {"Authorization": "Bearer gateway-secret"}
-    assert client.post(
-        "/opc/registrations",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 0,
-            "registration": {
-                "plc_device_id": "unregistered-plc",
-                "runtime_url": "opc.tcp://first:4840",
-                "variables": ["ready"],
-            },
-        },
-        headers=headers,
-    ).status_code == 200
-    trigger = {
-        "kind": "opc",
-        "config": {"plc_device_id": "plc-a", "variable": "ready", "value": True},
-    }
-    assert client.post(
-        "/templates",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 1,
-            "template": _template("task", input_triggers=[trigger], output_triggers=[trigger]),
-        },
-    ).status_code == 200
-
-    empty = client.patch(
-        "/templates/task",
-        json={"workflow_path": "demo.json", "expected_version": 2, "input_triggers": []},
-    )
-    assert empty.status_code == 200
-    missing = client.patch(
-        "/templates/task",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 3,
-            "output_triggers": [{
-                "kind": "opc",
-                "config": {"plc_device_id": "plc-a", "variable": "missing", "value": True},
-            }],
-        },
-    )
-    assert missing.status_code == 409
-    assert missing.json()["detail"]["code"] == "unregistered_plc_variable"
-
-
-def test_plc_registration_resolves_english_aliases_to_canonical_csv_names(tmp_path, monkeypatch):
-    """中文 CSV 节点名是 Task 持久化和快照判定的唯一键。"""
-    monkeypatch.setenv("TASK_ORCHESTRATION_GATEWAY_TOKEN", "gateway-secret")
-    client = _client_with_workflow(tmp_path)
-    headers = {"Authorization": "Bearer gateway-secret"}
-    canonical_name = "S08取放料产品"
-    english_alias = "S08_PickPlace_Product"
-
-    registration = client.post(
-        "/opc/registrations",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 0,
-            "registration": {
-                "plc_device_id": "szlab_poly_plc",
-                "runtime_url": "opc.tcp://plc:4840",
-                "variables": [canonical_name, "Ready"],
-                "aliases": {english_alias: canonical_name},
-            },
-        },
-        headers=headers,
-    )
-    assert registration.status_code == 200
-
-    alias_trigger = {
-        "kind": "opc",
-        "config": {
-            "plc_device_id": "szlab_poly_plc",
-            "variable": english_alias,
-            "value": 7,
-        },
-    }
-    direct_trigger = {
-        "kind": "opc",
-        "config": {
-            "plc_device_id": "szlab_poly_plc",
-            "variable": "Ready",
-            "value": True,
-        },
-    }
-    created = client.post(
-        "/templates",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 1,
-            "template": _template(
-                "alias-task",
-                input_triggers=[alias_trigger],
-                output_triggers=[direct_trigger],
-            ),
-        },
-    )
-    assert created.status_code == 200
-    stored_template = created.json()["workspace"]["templates"][0]
-    assert stored_template["input_triggers"][0]["config"]["variable"] == canonical_name
-    assert stored_template["output_triggers"][0]["config"]["variable"] == "Ready"
-
-    snapshot = client.post(
-        "/opc/snapshots",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 2,
-            "plc_device_id": "szlab_poly_plc",
-            "sequence": 1,
-            "values": {english_alias: 7, "Ready": True},
-        },
-        headers=headers,
-    )
-    assert snapshot.status_code == 200
-    values = next(
-        item["values"]
-        for item in snapshot.json()["workspace"]["opc_snapshots"]
-        if item["plc_device_id"] == "szlab_poly_plc"
-    )
-    assert values == {canonical_name: 7, "Ready": True}
 
 
 def test_plc_registration_uses_latest_workspace_when_frontend_version_is_stale(tmp_path):
@@ -2132,14 +1608,6 @@ def _action_request(
 
 def _client_with_running_action_tasks(tmp_path) -> TestClient:
     client = _client_with_workflow(tmp_path)
-    trigger_ready = {
-        "kind": "opc",
-        "config": {"plc_device_id": "plc-a", "variable": "ready", "value": True},
-    }
-    trigger_done = {
-        "kind": "opc",
-        "config": {"plc_device_id": "plc-a", "variable": "done", "value": True},
-    }
     workspace = {
         "workflow_path": "demo.json",
         "templates": [
@@ -2147,8 +1615,6 @@ def _client_with_running_action_tasks(tmp_path) -> TestClient:
                 **_template(
                     "pipeline",
                     resources=["robot", "s07", "s06"],
-                    input_triggers=[trigger_ready],
-                    output_triggers=[trigger_done],
                 ),
                 "node_ids": ["robot-action", "s07-action", "s06-action"],
             },
@@ -2156,8 +1622,6 @@ def _client_with_running_action_tasks(tmp_path) -> TestClient:
                 **_template(
                     "other",
                     resources=["s07", "s06"],
-                    input_triggers=[trigger_ready],
-                    output_triggers=[trigger_done],
                 ),
                 "node_ids": ["other-action"],
             },
@@ -2196,11 +1660,7 @@ def _client_with_running_action_tasks(tmp_path) -> TestClient:
             }
         ],
     }
-    saved = client.put(
-        "/workspaces",
-        json={"expected_version": 0, "workspace": workspace},
-    )
-    assert saved.status_code == 200
+    _seed_workspace(tmp_path, workspace)
     return client
 
 
@@ -2249,6 +1709,10 @@ def test_action_replay_persists_legacy_lease_cleanup(tmp_path, replay_kind):
             "id": "template",
             "name": "template",
             "node_ids": ["node-1", "node-2"],
+            "node_contracts": [
+                    _empty_contract("node-1"),
+                    _empty_contract("node-2"),
+            ],
         }],
         "task_instances": [instance],
         "dynamic_resource_leases": [{
@@ -2487,98 +1951,6 @@ def test_action_claim_succeed_ignores_resources_replays_and_output_gate(tmp_path
     assert final_action.json()["workspace"]["dynamic_resource_leases"] == []
 
 
-def test_failed_action_pauses_workspace_without_leases_and_never_retries(tmp_path):
-    client = _client_with_running_action_tasks(tmp_path)
-    claimed = client.post(
-        "/actions:claim",
-        json=_action_request(
-            1,
-            "pipeline-1",
-            "robot-action",
-            "exec-fail",
-            resources=["robot"],
-        ),
-    )
-    assert claimed.status_code == 200
-
-    failed = client.post(
-        "/actions:fail",
-        json=_action_request(
-            2,
-            "pipeline-1",
-            "robot-action",
-            "exec-fail",
-            error={"code": "robot_timeout", "retryable": False},
-        ),
-    )
-    assert failed.status_code == 200
-    workspace = failed.json()["workspace"]
-    instance = next(item for item in workspace["task_instances"] if item["id"] == "pipeline-1")
-    assert instance["status"] == "failed"
-    assert instance["execution_state"]["active_execution_id"] is None
-    assert [record["status"] for record in instance["execution_state"]["records"]] == ["failed"]
-    assert workspace["scheduler_paused"] is True
-    assert workspace["pause_reason"]["code"] == "action_failed"
-    assert workspace["pause_reason"]["detail"] == {
-        "error": {"code": "robot_timeout", "retryable": False}
-    }
-    assert workspace["dynamic_resource_leases"] == []
-
-    replay = client.post(
-        "/actions:fail",
-        json=_action_request(
-            2,
-            "pipeline-1",
-            "robot-action",
-            "exec-fail",
-            error={"code": "robot_timeout", "retryable": False},
-        ),
-    )
-    assert replay.status_code == 200
-    assert replay.json()["version"] == 3
-    conflict = client.post(
-        "/actions:fail",
-        json=_action_request(
-            2,
-            "pipeline-1",
-            "robot-action",
-            "exec-fail",
-            error={"code": "robot_timeout", "retryable": 0},
-        ),
-    )
-    assert conflict.status_code == 409
-    assert conflict.json()["detail"]["code"] == "action_replay_conflict"
-    unpause = client.post(
-        "/schedule:plan",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 3,
-            "paused": False,
-        },
-    )
-    assert unpause.status_code == 409
-    assert unpause.json()["detail"]["code"] == "workspace_recovery_required"
-    rejected = client.post(
-        "/actions:claim",
-        json=_action_request(
-            3,
-            "other-1",
-            "other-action",
-            "exec-after-fail",
-            resources=[],
-        ),
-    )
-    assert rejected.status_code == 409
-    assert rejected.json()["detail"]["code"] == "workspace_paused"
-    assert len(
-        next(
-            item
-            for item in replay.json()["workspace"]["task_instances"]
-            if item["id"] == "pipeline-1"
-        )["execution_state"]["records"]
-    ) == 1
-
-
 def test_explicit_completion_requires_exhausted_cursor_and_no_active_action(tmp_path):
     client = _client_with_running_action_tasks(tmp_path)
     snapshot = client.post(
@@ -2683,7 +2055,10 @@ def test_concurrent_action_claims_across_stores_are_version_serialized(
                     id="shared",
                     name="shared",
                     node_ids=["node"],
-                    resources=["robot"],
+                    node_contracts=[
+                        _empty_contract("node")
+                    ],
+                    resource_requirements=["robot"],
                 )
             ],
             task_instances=[
@@ -2777,18 +2152,14 @@ def test_advance_starts_three_samples_before_action_resource_claims(tmp_path):
     ]
 
 
-def test_empty_trigger_template_starts_and_completes_after_its_nodes(tmp_path):
+def test_compiled_template_starts_and_completes_after_its_nodes(tmp_path):
     client = _client_with_workflow(tmp_path)
     created = client.post(
         "/templates",
         json={
             "workflow_path": "demo.json",
             "expected_version": 0,
-            "template": _template(
-                "ungated",
-                input_triggers=[],
-                output_triggers=[],
-            ),
+            "template": _template("ungated"),
         },
     )
     assert created.status_code == 200
@@ -2895,23 +2266,15 @@ def test_last_action_completes_without_waiting_for_false_output_trigger(tmp_path
     )["status"] == "completed"
 
 
-def test_poll_completes_exhausted_task_without_output_trigger_gate(tmp_path):
+def test_poll_completes_exhausted_task_without_runtime_admission(tmp_path):
     client = _client_with_workflow(tmp_path)
-    false_output = {
-        "kind": "opc",
-        "config": {"plc_device_id": "plc-a", "variable": "done", "value": True},
-    }
     assert client.post(
         "/templates",
         json={
             "workflow_path": "demo.json",
             "expected_version": 0,
             "template": {
-                **_template(
-                    "poll-complete",
-                    input_triggers=[],
-                    output_triggers=[false_output],
-                ),
+                **_template("poll-complete"),
                 "node_ids": [],
             },
         },
@@ -2995,7 +2358,10 @@ def test_plan_clears_legacy_leases_but_get_does_not_rewrite_sidecar(tmp_path):
             "id": "legacy",
             "name": "legacy",
             "node_ids": ["node"],
-            "resources": ["robot"],
+            "node_contracts": [
+                    _empty_contract("node")
+            ],
+            "resource_requirements": ["robot"],
         }],
         "task_instances": [{
             "id": "instance",
@@ -3056,7 +2422,10 @@ def test_put_workspace_clears_legacy_dynamic_resource_leases(tmp_path):
             "id": "legacy",
             "name": "legacy",
             "node_ids": ["node"],
-            "resources": ["robot"],
+            "node_contracts": [
+                    _empty_contract("node")
+            ],
+            "resource_requirements": ["robot"],
         }],
         "task_instances": [{
             "id": "instance",
@@ -3086,12 +2455,19 @@ def test_put_workspace_clears_legacy_dynamic_resource_leases(tmp_path):
             "acquired_at": 1,
         }],
     })
+    WorkspaceStore(tmp_path).put(
+        Workspace(
+            workflow_path="demo.json",
+            templates=legacy_workspace.templates,
+        ),
+        expected_version=0,
+    )
     client = TestClient(create_app(tmp_path))
 
     saved = client.put(
         "/workspaces",
         json={
-            "expected_version": 0,
+            "expected_version": 1,
             "workspace": legacy_workspace.model_dump(mode="json"),
         },
     )
@@ -3103,7 +2479,7 @@ def test_put_workspace_clears_legacy_dynamic_resource_leases(tmp_path):
     ).json()["workspace"]["dynamic_resource_leases"] == []
 
 
-def test_template_create_and_update_clear_legacy_resources(tmp_path):
+def test_template_create_rejects_reintroduced_legacy_resources(tmp_path):
     client = _client_with_workflow(tmp_path)
     created = client.post(
         "/templates",
@@ -3117,7 +2493,10 @@ def test_template_create_and_update_clear_legacy_resources(tmp_path):
         },
     )
     assert created.status_code == 200
-    assert created.json()["workspace"]["templates"][0]["resources"] == []
+    assert (
+        created.json()["workspace"]["templates"][0]["resource_requirements"]
+        == []
+    )
 
     legacy_workspace = created.json()["workspace"]
     legacy_workspace["templates"][0]["resources"] = ["reintroduced"]
@@ -3125,18 +2504,7 @@ def test_template_create_and_update_clear_legacy_resources(tmp_path):
         "/workspaces",
         json={"expected_version": 1, "workspace": legacy_workspace},
     )
-    assert persisted.status_code == 200
-    updated = client.patch(
-        "/templates/created",
-        json={
-            "workflow_path": "demo.json",
-            "expected_version": 2,
-            "name": "Updated",
-        },
-    )
-
-    assert updated.status_code == 200
-    assert updated.json()["workspace"]["templates"][0]["resources"] == []
+    assert persisted.status_code == 422
 
 
 def test_gantt_ignores_legacy_resources_across_samples(tmp_path):
@@ -3150,7 +2518,10 @@ def test_gantt_ignores_legacy_resources_across_samples(tmp_path):
                     id="shared",
                     name="shared",
                     node_ids=["node"],
-                    resources=["legacy-robot"],
+                    node_contracts=[
+                        _empty_contract("node")
+                    ],
+                    resource_requirements=["legacy-robot"],
                 )
             ],
             task_instances=[

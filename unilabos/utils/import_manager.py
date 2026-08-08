@@ -264,6 +264,18 @@ class ImportManager:
             }
             for k, v in body.get("auto_methods", {}).items()
         }
+        for name, action_info in body.get("actions", {}).items():
+            result["action_methods"][name] = {
+                "args": action_info.get("params", []),
+                "return_type": action_info.get("return_type", ""),
+                "is_async": action_info.get("is_async", False),
+                "always_free": action_info.get("action_args", {}).get(
+                    "always_free",
+                    False,
+                ),
+                "docstring": action_info.get("docstring"),
+                "action_args": action_info.get("action_args", {}),
+            }
         result["ast_analysis_success"] = True
         return result
 

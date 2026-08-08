@@ -61,7 +61,7 @@
       "task_template_ids": ["szlab-e2e-s07"],
       "device_id": "szlab_mixer_robot",
       "method": "submit_place_to_s072",
-      "params": {"product_type": 1, "position": 1},
+      "params": {"product_type": 1},
       "channel": "robot",
       "trigger": {"all": [
         {"variable": "Robot_任务写入完成", "operator": "eq", "value": true, "edge": "rising"},
@@ -115,7 +115,7 @@
       "task_template_ids": ["szlab-e2e-s06"],
       "device_id": "szlab_mixer_robot",
       "method": "submit_pick_from_s072",
-      "params": {"product_type": 1, "position": 1},
+      "params": {"product_type": 1},
       "channel": "robot",
       "trigger": {"all": [
         {"variable": "Robot_任务写入完成", "operator": "eq", "value": true, "edge": "rising"},

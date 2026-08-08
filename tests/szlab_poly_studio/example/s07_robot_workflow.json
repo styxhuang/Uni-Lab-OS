@@ -14,8 +14,7 @@
       "name": "auto-submit_place_to_s072",
       "device_name": "szlab_mixer_robot",
       "param": {
-        "product_type": 1,
-        "position": 1
+        "product_type": 1
       }
     },
     {
@@ -23,8 +22,7 @@
       "name": "auto-submit_pick_from_s072",
       "device_name": "szlab_mixer_robot",
       "param": {
-        "product_type": 1,
-        "position": 1
+        "product_type": 1
       }
     }
   ],

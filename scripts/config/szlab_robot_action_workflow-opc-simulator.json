@@ -155,8 +155,7 @@
       "device_id": "szlab_mixer_robot",
       "method": "submit_place_to_s072",
       "params": {
-        "product_type": 2,
-        "position": 1
+        "product_type": 2
       },
       "channel": "",
       "trigger": {
