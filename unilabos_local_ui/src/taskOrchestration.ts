@@ -14,6 +14,11 @@ export type TriggerCondition = {
   value: string | number | boolean;
 };
 
+export type TaskDependencyModel = {
+  templateId: string;
+  nodeId: string | null;
+};
+
 export type TaskTemplateModel = {
   id: string;
   name: string;
@@ -22,6 +27,7 @@ export type TaskTemplateModel = {
   gates: string[];
   inputTriggers?: TriggerCondition[];
   outputTriggers?: TriggerCondition[];
+  dependencies?: TaskDependencyModel[] | null;
 };
 
 export type TaskNodeDescriptor = {
@@ -157,6 +163,7 @@ export type TaskActionExecutionRecord = {
   status: 'pending' | 'running' | 'succeeded' | 'failed';
   startedAt?: number;
   finishedAt?: number;
+  error?: Record<string, unknown> | null;
 };
 
 export type TaskActionAttemptTiming = TaskActionExecutionRecord & {
@@ -388,6 +395,23 @@ export function sampleProcessRowStatus(
   return 'queued';
 }
 
+export function compareSampleIds(left: string, right: string): number {
+  const sampleOrdinal = (sampleId: string) => {
+    const match = /^Sample\s+([A-Z]+)$/i.exec(sampleId.trim());
+    if (!match) return null;
+    return [...match[1].toUpperCase()].reduce(
+      (ordinal, character) => ordinal * 26 + character.charCodeAt(0) - 64,
+      0,
+    );
+  };
+  const leftOrdinal = sampleOrdinal(left);
+  const rightOrdinal = sampleOrdinal(right);
+  if (leftOrdinal !== null && rightOrdinal !== null) return leftOrdinal - rightOrdinal;
+  if (leftOrdinal !== null) return -1;
+  if (rightOrdinal !== null) return 1;
+  return left.localeCompare(right, 'zh-CN', { numeric: true });
+}
+
 export function buildSampleProcessRows(
   instances: TaskInstanceProcessInput[],
   templates: Array<Pick<TaskTemplateModel, 'id' | 'name' | 'nodeIds'>>,
@@ -425,7 +449,7 @@ export function buildSampleProcessRows(
     bySample.set(instance.sample, bucket);
   }
   return Array.from(bySample.entries())
-    .sort(([left], [right]) => left.localeCompare(right, 'zh-CN'))
+    .sort(([left], [right]) => compareSampleIds(left, right))
     .map(([sample, blocks]) => ({
       sample,
       blocks: blocks.sort((left, right) => left.order - right.order || left.templateId.localeCompare(right.templateId)),
@@ -531,6 +555,14 @@ export function updateScheduledTemplateDraft(
     : current;
 }
 
+export function orderSelectedTemplateIds(
+  templates: Array<Pick<TaskTemplateModel, 'id'>>,
+  selectedTemplateIds: readonly string[],
+) {
+  const selected = new Set(selectedTemplateIds);
+  return templates.filter((template) => selected.has(template.id)).map((template) => template.id);
+}
+
 /** output_triggers 只描述完成后的输出动作，不门控 Task 完成；waiting 仅含输入阶段的 waiting/pending。 */
 export function isTaskWaitingStatus(status: string) {
   return status === 'waiting' || status === 'pending';
@@ -602,6 +634,7 @@ export function createTaskTemplateDraft(
     gates: [],
     inputTriggers: [],
     outputTriggers: [],
+    dependencies: null,
   };
 }
 

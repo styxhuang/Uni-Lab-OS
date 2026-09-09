@@ -5,7 +5,12 @@ import sqlite3
 import pytest
 import scripts.workflow_ui as workflow_ui
 from scripts.run_history_store import RunHistoryStore, infer_station
-from scripts.run_workflow_local import WorkflowNode
+from scripts.run_workflow_local import (
+    RuntimeConfig,
+    RuntimeDeviceFactoryConfig,
+    RuntimeOpcSnapshotConfig,
+    WorkflowNode,
+)
 from scripts.workflow_ui import WorkflowRunManager, _load_preset_runtime_config, load_preset
 
 
@@ -38,6 +43,56 @@ def _start_action(
         params=params or {},
         started_at=started_at,
     )
+
+
+def test_initialize_eagerly_creates_database_and_directories(tmp_path):
+    store = RunHistoryStore(tmp_path, session_id="run-initialize")
+
+    paths = store.initialize()
+
+    assert (tmp_path / "history.db").is_file()
+    assert (tmp_path / "exports").is_dir()
+    assert (tmp_path / "artifacts").is_dir()
+    assert (tmp_path / "backups").is_dir()
+    assert paths["database_path"] == str((tmp_path / "history.db").resolve())
+
+
+def test_scheduler_timings_are_persisted_in_history_database(tmp_path):
+    store = RunHistoryStore(tmp_path, session_id="run-timing")
+
+    written = store.append_scheduler_timings(
+        workflow_path="task-flow.json",
+        entries=[
+            {
+                "cycle_id": 7,
+                "step": "opc_poll",
+                "phase": "finish",
+                "timestamp_ms": 12_345,
+                "duration_ms": 7344,
+            },
+            {
+                "generation_id": 3,
+                "step": "controller_run",
+                "phase": "skipped",
+                "reason": "in_flight",
+                "timestamp_ms": 12_346,
+            },
+        ],
+    )
+
+    assert written == 2
+    connection = sqlite3.connect(tmp_path / "history.db")
+    rows = connection.execute(
+        """
+        SELECT workflow_path, cycle_id, generation_id, step, phase,
+               timestamp, duration_ms, reason
+        FROM scheduler_timings ORDER BY id
+        """
+    ).fetchall()
+    assert rows == [
+        ("task-flow.json", "7", "", "opc_poll", "finish", 12_345, 7344, ""),
+        ("task-flow.json", "", "3", "controller_run", "skipped", 12_346, None, "in_flight"),
+    ]
 
 
 def test_timing_ledger_records_sample_device_station_and_robot_idle(tmp_path):
@@ -444,11 +499,445 @@ def test_task_action_error_is_recorded_with_sample_station_and_time(
             },
         )
 
-    incident = store.incident_ledger("run-error")["incidents"][0]
+    entries = manager.list_task_action_logs(
+        workflow_path="main-process.json"
+    )["entries"]
+    assert len(entries) == 1
+    assert entries[0]["category"] == "action"
+    assert entries[0]["level"] == "error"
+    assert entries[0]["code"] == "action_exception"
+    assert entries[0]["phase"] == "executing"
+    assert entries[0]["message"] == (
+        "Action 执行失败：RuntimeError：S08 工站报警中"
+    )
+    assert entries[0]["detail"]["exception_type"] == "RuntimeError"
+
+    incidents = store.incident_ledger("run-error")["incidents"]
+    assert len(incidents) == 1
+    incident = incidents[0]
     assert incident["code"] == "action_failed"
     assert incident["sample_id"] == "sample-8"
     assert incident["instance_id"] == "instance-8"
     assert incident["station"] == "S08"
     assert incident["first_seen_at"] == 5_000
     assert incident["message"] == "S08 工站报警中"
+    manager.shutdown()
+
+
+def test_task_action_false_result_is_logged_once_as_failed_result(tmp_path):
+    store = RunHistoryStore(tmp_path, session_id="run-failed-result")
+    preset = load_preset("szlab_robot_action_workflow")
+    manager = WorkflowRunManager(
+        preset,
+        _load_preset_runtime_config(preset),
+        run_history_store=store,
+    )
+    node = WorkflowNode(
+        uuid="failed-node",
+        name="fail_action",
+        device_name="device",
+        method="fail_action",
+        param={},
+        legacy_route_compatible=False,
+    )
+
+    class FailedDevice:
+        def fail_action(self):
+            return {"success": False, "message": "目标工位被占用"}
+
+    device = FailedDevice()
+    with pytest.raises(workflow_ui.ActionReturnedFailure):
+        manager._run_task_action_node(
+            node,
+            {"device": device},
+            device.fail_action,
+            {
+                "workflow_path": "main-process.json",
+                "instance_id": "instance-failed",
+                "sample_id": "sample-failed",
+                "template_id": "template-failed",
+                "node_id": "failed-node",
+                "execution_id": "execution-failed",
+                "device_id": "device",
+                "action_name": "fail_action",
+            },
+        )
+
+    entries = manager.list_task_action_logs(
+        workflow_path="main-process.json"
+    )["entries"]
+    assert len(entries) == 2
+    result_entries = [entry for entry in entries if entry["category"] == "result"]
+    assert len(result_entries) == 1
+    assert result_entries[0]["level"] == "error"
+    assert result_entries[0]["code"] == "action_returned_failure"
+    assert result_entries[0]["message"] == "动作结果：失败 · 目标工位被占用"
+    assert not any(entry["code"] == "action_exception" for entry in entries)
+
+    incidents = store.incident_ledger("run-failed-result")["incidents"]
+    assert len(incidents) == 1
+    assert incidents[0]["code"] == "action_returned_failure"
+    manager.shutdown()
+
+
+def test_scheduler_errors_flow_to_task_logs_once_until_recovered(tmp_path):
+    store = RunHistoryStore(tmp_path, session_id="run-scheduler-error")
+    preset = load_preset("szlab_robot_action_workflow")
+    manager = WorkflowRunManager(
+        preset,
+        _load_preset_runtime_config(preset),
+        run_history_store=store,
+    )
+    manager._task_execution_coordinator.shutdown()
+    diagnostic = {
+        "category": "dispatch_error",
+        "code": "unsupported_action",
+        "message": "不支持的 Task 动作节点: unknown-node",
+        "severity": "error",
+        "immediate": True,
+        "phase": "dispatching",
+        "instance_id": "instance-1",
+        "sample_id": "sample-1",
+        "template_id": "template-1",
+        "node_id": "unknown-node",
+        "execution_id": "execution-1",
+        "device_id": "missing-device",
+        "action_name": "missing-action",
+        "detail": {"reason": "method_not_found"},
+    }
+
+    class FakeCoordinator:
+        def __init__(self):
+            self.calls = 0
+
+        def cycle(self, **_kwargs):
+            self.calls += 1
+            diagnostics = [] if self.calls == 3 else [dict(diagnostic)]
+            return {
+                "success": True,
+                "active": 1,
+                "in_flight": 0,
+                "claimed": 0,
+                "completed": 0,
+                "failed": 0,
+                "diagnostics": diagnostics,
+            }
+
+        def shutdown(self):
+            return {"success": True, "in_flight": 0}
+
+    manager._task_execution_coordinator = FakeCoordinator()
+    for _index in range(4):
+        manager.run_task_execution_cycle(
+            workflow_path="main-process.json",
+            workflow_payload={"nodes": []},
+        )
+
+    entries = manager.list_task_action_logs(
+        workflow_path="main-process.json"
+    )["entries"]
+    assert len(entries) == 3
+    assert [entry["category"] for entry in entries] == [
+        "schedule",
+        "schedule",
+        "schedule",
+    ]
+    assert [entry["level"] for entry in entries] == ["error", "info", "error"]
+    assert [entry["code"] for entry in entries] == [
+        "unsupported_action",
+        "scheduler_error_recovered",
+        "unsupported_action",
+    ]
+    assert entries[0]["phase"] == "dispatching"
+    assert entries[0]["execution_id"] == "execution-1"
+    assert entries[0]["detail"] == {
+        "type": "scheduler_diagnostic",
+        "diagnostic_category": "dispatch_error",
+        "immediate": True,
+        "diagnostic": {"reason": "method_not_found"},
+    }
+    assert entries[1]["phase"] == "recovered"
+    assert entries[1]["detail"]["original_code"] == "unsupported_action"
+    manager.shutdown()
+
+
+def test_scheduler_cycle_exception_flows_to_task_error_log_without_spam(tmp_path):
+    store = RunHistoryStore(tmp_path, session_id="run-cycle-error")
+    preset = load_preset("szlab_robot_action_workflow")
+    manager = WorkflowRunManager(
+        preset,
+        _load_preset_runtime_config(preset),
+        run_history_store=store,
+    )
+    manager._task_execution_coordinator.shutdown()
+
+    class RaisingCoordinator:
+        def cycle(self, **_kwargs):
+            raise TimeoutError("Task 服务连接超时")
+
+        def shutdown(self):
+            return {"success": True, "in_flight": 0}
+
+    manager._task_execution_coordinator = RaisingCoordinator()
+    for _index in range(2):
+        with pytest.raises(TimeoutError, match="Task 服务连接超时"):
+            manager.run_task_execution_cycle(
+                workflow_path="main-process.json",
+                workflow_payload={"nodes": []},
+            )
+
+    entries = manager.list_task_action_logs(
+        workflow_path="main-process.json"
+    )["entries"]
+    assert len(entries) == 1
+    assert entries[0]["category"] == "schedule"
+    assert entries[0]["level"] == "error"
+    assert entries[0]["code"] == "execution_cycle_failed"
+    assert entries[0]["phase"] == "scheduling"
+    assert entries[0]["message"] == (
+        "调度循环失败：TimeoutError：Task 服务连接超时"
+    )
+    assert entries[0]["detail"]["diagnostic"]["exception_type"] == (
+        "TimeoutError"
+    )
+    manager.shutdown()
+
+
+def test_action_opc_snapshot_failures_are_structured_errors(tmp_path):
+    store = RunHistoryStore(tmp_path, session_id="run-opc-snapshot-error")
+    runtime_config = RuntimeConfig(
+        path=tmp_path / "runtime.json",
+        device_factory=RuntimeDeviceFactoryConfig(),
+        opc_snapshot=RuntimeOpcSnapshotConfig(
+            action_variables={"run": ["ready"]}
+        ),
+    )
+    manager = WorkflowRunManager(
+        load_preset("szlab_robot_action_workflow"),
+        runtime_config,
+        run_history_store=store,
+    )
+
+    class OfflineDevice:
+        @staticmethod
+        def get_variables(_names, use_cache=False):
+            assert use_cache is False
+            return {"ready": {"success": False, "error": "offline"}}
+
+        @staticmethod
+        def run():
+            return {"success": True}
+
+    device = OfflineDevice()
+    result = manager._run_task_action_node(
+        WorkflowNode(
+            uuid="opc-node",
+            name="run",
+            device_name="device",
+            method="run",
+            param={},
+            legacy_route_compatible=False,
+        ),
+        {"device": device},
+        device.run,
+        {
+            "workflow_path": "main-process.json",
+            "instance_id": "instance-opc",
+            "sample_id": "sample-opc",
+            "template_id": "template-opc",
+            "node_id": "opc-node",
+            "execution_id": "execution-opc",
+            "device_id": "device",
+            "action_name": "run",
+        },
+    )
+
+    assert result[0]["result"] == {"success": True}
+    entries = manager.list_task_action_logs(
+        workflow_path="main-process.json"
+    )["entries"]
+    failures = [
+        entry
+        for entry in entries
+        if entry["code"] == "opc_snapshot_read_failed"
+    ]
+    assert [entry["phase"] for entry in failures] == [
+        "sampling_before",
+        "sampling_after",
+    ]
+    assert all(entry["category"] == "opc" for entry in failures)
+    assert all(entry["level"] == "error" for entry in failures)
+    assert failures[0]["detail"]["failures"][0]["name"] == "ready"
+    assert failures[0]["detail"]["failures"][0]["error"] == "offline"
+
+    incidents = store.incident_ledger("run-opc-snapshot-error")["incidents"]
+    assert len(incidents) == 2
+    assert all(incident["category"] == "opc_error" for incident in incidents)
+    manager.shutdown()
+
+
+def test_action_opc_snapshot_failure_emits_recovery_after_success(tmp_path):
+    store = RunHistoryStore(tmp_path, session_id="run-opc-snapshot-recovery")
+    runtime_config = RuntimeConfig(
+        path=tmp_path / "runtime.json",
+        device_factory=RuntimeDeviceFactoryConfig(),
+        opc_snapshot=RuntimeOpcSnapshotConfig(
+            action_variables={"run": ["ready"]}
+        ),
+    )
+    manager = WorkflowRunManager(
+        load_preset("szlab_robot_action_workflow"),
+        runtime_config,
+        run_history_store=store,
+    )
+
+    class RecoveringDevice:
+        reads = 0
+
+        @classmethod
+        def get_variables(cls, _names, use_cache=False):
+            assert use_cache is False
+            cls.reads += 1
+            if cls.reads == 1:
+                return {"ready": {"success": False, "error": "offline"}}
+            return {"ready": {"success": True, "value": True}}
+
+        @staticmethod
+        def run():
+            return {"success": True}
+
+    device = RecoveringDevice()
+    manager._run_task_action_node(
+        WorkflowNode(
+            uuid="opc-recovery-node",
+            name="run",
+            device_name="device",
+            method="run",
+            param={},
+            legacy_route_compatible=False,
+        ),
+        {"device": device},
+        device.run,
+        {
+            "workflow_path": "main-process.json",
+            "instance_id": "instance-opc-recovery",
+            "node_id": "opc-recovery-node",
+            "execution_id": "execution-opc-recovery",
+            "device_id": "device",
+            "action_name": "run",
+        },
+    )
+
+    entries = manager.list_task_action_logs(
+        workflow_path="main-process.json"
+    )["entries"]
+    opc_entries = [
+        entry
+        for entry in entries
+        if entry["code"]
+        in {"opc_snapshot_read_failed", "opc_snapshot_recovered"}
+    ]
+    assert [entry["code"] for entry in opc_entries] == [
+        "opc_snapshot_read_failed",
+        "opc_snapshot_recovered",
+    ]
+    assert [entry["level"] for entry in opc_entries] == ["error", "info"]
+    assert opc_entries[1]["phase"] == "sampling_after"
+    assert opc_entries[1]["detail"]["recovered_failures"][0]["name"] == "ready"
+    manager.shutdown()
+
+
+def test_task_opc_poll_error_is_deduplicated_until_recovery(tmp_path):
+    store = RunHistoryStore(tmp_path, session_id="run-opc-poll-error")
+    preset = load_preset("stack_s05_s06")
+    manager = WorkflowRunManager(
+        preset,
+        _load_preset_runtime_config(preset),
+        run_history_store=store,
+    )
+
+    class FakePLC:
+        client = object()
+        failed = True
+
+        @staticmethod
+        def registered_variables():
+            return ["ready"]
+
+        def get_variables(self, names, use_cache=False):
+            assert names == ["ready"]
+            assert use_cache is False
+            if self.failed:
+                return {"ready": {"success": False, "error": "offline"}}
+            return {"ready": {"success": True, "value": True}}
+
+    class FakePublisher:
+        @staticmethod
+        def get_workspace(**_kwargs):
+            return {
+                "version": 7,
+                "workspace": {
+                    "templates": [
+                        {
+                            "id": "template-1",
+                            "input_triggers": [
+                                {
+                                    "kind": "opc",
+                                    "config": {
+                                        "plc_device_id": "szlab_poly_plc",
+                                        "variable": "ready",
+                                        "value": True,
+                                    },
+                                }
+                            ],
+                            "output_triggers": [],
+                        }
+                    ],
+                    "task_instances": [
+                        {"template_id": "template-1", "status": "waiting"}
+                    ],
+                },
+            }
+
+        @staticmethod
+        def publish_snapshot(**_kwargs):
+            return None
+
+    plc = FakePLC()
+    manager._cached_devices = {"szlab_poly_plc": plc}
+    manager._task_snapshot_publisher = FakePublisher()
+
+    first = manager.poll_task_opc(workflow_path="main-process.json")
+    second = manager.poll_task_opc(workflow_path="main-process.json")
+    plc.failed = False
+    recovered = manager.poll_task_opc(workflow_path="main-process.json")
+    plc.failed = True
+    repeated = manager.poll_task_opc(workflow_path="main-process.json")
+
+    assert first == second == repeated == {
+        "success": False,
+        "active": True,
+        "message": "当前 Task 条件变量均无法读取",
+    }
+    assert recovered == {
+        "success": True,
+        "active": True,
+        "variable_count": 1,
+    }
+    entries = manager.list_task_action_logs(
+        workflow_path="main-process.json"
+    )["entries"]
+    assert len(entries) == 3
+    assert [entry["code"] for entry in entries] == [
+        "opc_input_snapshot_failed",
+        "opc_error_recovered",
+        "opc_input_snapshot_failed",
+    ]
+    assert all(entry["category"] == "opc" for entry in entries)
+    assert [entry["level"] for entry in entries] == ["error", "info", "error"]
+    assert entries[1]["phase"] == "recovered"
+    assert entries[1]["detail"]["operation"] == "poll"
+    assert entries[1]["detail"]["original_code"] == (
+        "opc_input_snapshot_failed"
+    )
     manager.shutdown()

@@ -15,6 +15,7 @@ from .models import (
     SchedulingResult,
     PlcRegistration,
     OpcSnapshotState,
+    TaskDependency,
     TaskScheduleEntry,
     TaskInstance,
     Template,
@@ -155,7 +156,10 @@ class WorkspaceService:
         name: str | None = None,
         input_triggers: list[Trigger] | None = None,
         output_triggers: list[Trigger] | None = None,
+        dependencies: list[TaskDependency] | None = None,
     ):
+        """热更新共享模板；未启动实例在下一轮调度采用新的依赖。"""
+
         def operation(workspace: Workspace) -> Workspace:
             template = self._template(workspace, template_id)
             updates = {}
@@ -171,8 +175,15 @@ class WorkspaceService:
                 updates["output_triggers"] = self._canonicalize_triggers(
                     workspace, output_triggers, "output"
                 )
+            if dependencies is not None:
+                updates["dependencies"] = dependencies
             updates["resources"] = []
-            replacement = template.model_copy(update=updates)
+            try:
+                replacement = template.validated_copy(update=updates)
+            except ValueError as exc:
+                raise WorkspaceServiceError(
+                    "invalid_task_dependencies", str(exc)
+                ) from exc
             return workspace.model_copy(
                 update={
                     "templates": [
@@ -511,6 +522,79 @@ class WorkspaceService:
                     "scheduler_paused": True,
                     "dynamic_resource_leases": [],
                     "events": [*retained_events, event],
+                }
+            )
+
+        return self._mutate(
+            workflow_path, expected_version=expected_version, operation=operation
+        )
+
+    def reset_instances_progress(self, workflow_path: str, expected_version: int):
+        """保留 Task、顺序与参数，以新实例 ID 重置整队执行进度。"""
+
+        def operation(workspace: Workspace) -> Workspace:
+            if not workspace.scheduler_paused:
+                raise WorkspaceServiceError(
+                    "scheduler_active",
+                    "pause scheduler before resetting task progress",
+                )
+            if any(
+                instance.execution_state.active_execution_id is not None
+                or instance.execution_state.active_node_id is not None
+                or any(
+                    record.status == "running"
+                    for record in instance.execution_state.records
+                )
+                for instance in workspace.task_instances
+            ):
+                raise WorkspaceServiceError(
+                    "actions_in_flight",
+                    "wait for active actions before resetting task progress",
+                )
+
+            reset_at = self._clock()
+            not_before_values = [
+                instance.not_before
+                for instance in workspace.task_instances
+                if instance.not_before is not None
+            ]
+            first_not_before = min(not_before_values, default=reset_at)
+            reset_instances = [
+                TaskInstance(
+                    id=uuid4().hex,
+                    template_id=instance.template_id,
+                    status="waiting",
+                    sample_id=instance.sample_id,
+                    order=instance.order,
+                    payload=instance.payload,
+                    not_before=(
+                        reset_at
+                        if instance.not_before is None
+                        else reset_at + max(0, instance.not_before - first_not_before)
+                    ),
+                )
+                for instance in workspace.task_instances
+            ]
+            retained_events = [
+                event for event in workspace.events if event.instance_id is None
+            ]
+            event = WorkspaceEvent(
+                kind="instances_progress_reset",
+                timestamp=reset_at,
+                idempotency_key=(
+                    f"{workspace.workflow_path}/instances/reset-progress/"
+                    f"{expected_version}"
+                ),
+                payload={"reset_instance_count": len(reset_instances)},
+            )
+            return workspace.validated_copy(
+                update={
+                    "task_instances": reset_instances,
+                    "events": [*retained_events, event],
+                    "scheduler_paused": True,
+                    "pause_reason": None,
+                    "schedule_entries": [],
+                    "dynamic_resource_leases": [],
                 }
             )
 

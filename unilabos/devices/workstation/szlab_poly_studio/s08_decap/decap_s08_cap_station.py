@@ -363,6 +363,9 @@ class SZLabS08CapStationDevice:
             else:
                 ok = False
                 while True:
+                    abort_check = getattr(plc, "_mixing_wait_should_abort", None)
+                    if callable(abort_check) and abort_check():
+                        break
                     if self._read_variable(node_name) == expected:
                         ok = True
                         break
@@ -425,6 +428,10 @@ class SZLabS08CapStationDevice:
 
         last_seen: int | None = None
         while True:
+            abort_check = getattr(plc, "_mixing_wait_should_abort", None)
+            if callable(abort_check) and abort_check():
+                self._last_process_complete_seen = last_seen
+                return False
             try:
                 last_seen = self._read_process_complete_int()
             except Exception as exc:
@@ -435,6 +442,8 @@ class SZLabS08CapStationDevice:
                 logger.info(f"✓ {desc}")
                 return True
             time.sleep(interval)
+        self._last_process_complete_seen = last_seen
+        return False
 
     @not_action
     def _process_complete_wait_message(self, expected: int, task_label: str) -> str:
@@ -906,7 +915,7 @@ class SZLabS08CapStationDevice:
         self,
         工艺选择: int = int(S08ProcessType.OPEN_LIQUID_VIAL_100ML),
         样品ID: list[int] | None = None,
-        瓶盖暂存位: int = 1,
+        瓶盖暂存位: int | None = None,
     ) -> dict[str, Any]:
         try:
             process_type = _resolve_process_type_by_id(工艺选择)

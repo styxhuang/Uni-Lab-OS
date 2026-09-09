@@ -1,8 +1,33 @@
 import React from 'react';
 import './taskSchedulerBench.css';
+import {
+  automaticActionParameterDescription,
+  isAutomaticallyManagedActionParameter,
+  stripAutomaticallyManagedActionParameters,
+} from './automaticActionParameters';
 import type { TaskProcessLogLine, TaskVariableRow } from './taskActionLog';
+import {
+  canStartTaskDispatch,
+  taskDispatchButtonTitle,
+  taskDispatchIssueResolution,
+  taskDispatchReadinessLabel,
+  type TaskDispatchPreflightIssue,
+  type TaskDispatchReadiness,
+} from './taskDispatchPreflight';
 import type { OpcSimulatorStatus } from './opcSimulatorProfile';
-import type { TaskLogCategory, TaskLogLine } from './taskLogSession';
+import {
+  countTaskErrorStates,
+  countTaskLogCategories,
+  formatTaskLogMetadata,
+  filterTaskErrorLines,
+  filterTaskLogLines,
+  isTaskLogRecovery,
+  taskLogCategoryLabel,
+  taskLogPhaseLabel,
+  type TaskErrorStateFilter,
+  type TaskLogCategory,
+  type TaskLogLine,
+} from './taskLogSession';
 import {
   buildSampleProcessRows,
   buildExecutionTimingSummaries,
@@ -69,13 +94,14 @@ type LiquidAddition = {
   liquid_station_index: number | string;
   solvent_batch_id: string;
   volume: number | string;
+  reuse_tip: boolean;
 };
 
 const S07_POWDER_PARAMETERS = new Set([
   'coarse_position', 'fine_position', 'target_weight', 'recipe_name', 'params_json', 'powder_count', 'powder_additions',
 ]);
 const S09_LIQUID_PARAMETERS = new Set([
-  'liquid_station_index', 'solvent_batch_id', 'volume', 'liquid_count', 'liquid_additions', 'measure_density',
+  'liquid_station_index', 'solvent_batch_id', 'volume', 'reuse_tip', 'liquid_count', 'liquid_additions',
   'initialize_tip_inventory', 'initial_used_tip_count',
 ]);
 
@@ -122,9 +148,10 @@ function liquidAdditionsFromValues(values: Record<string, unknown>): LiquidAddit
     liquid_station_index: Number(values.liquid_station_index ?? 1),
     solvent_batch_id: String(values.solvent_batch_id ?? ''),
     volume: Number(values.volume ?? 1),
+    reuse_tip: true,
   }];
   const count = Math.max(1, Math.floor(Number(values.liquid_count) || 1));
-  while (additions.length < count) additions.push({ liquid_station_index: 1, solvent_batch_id: '', volume: '' });
+  while (additions.length < count) additions.push({ liquid_station_index: 1, solvent_batch_id: '', volume: '', reuse_tip: true });
   return additions;
 }
 
@@ -138,6 +165,7 @@ type Props = {
   rememberedParameterCount: number;
   isRunning: boolean;
   isTransitioning: boolean;
+  dispatchReadiness: TaskDispatchReadiness;
   environment: 'simulated' | 'real';
   selectedTaskId: string | null;
   onSampleCountChange: (value: number) => void;
@@ -146,6 +174,9 @@ type Props = {
   onGenerate: () => void;
   onClearRememberedParameters: () => void;
   onClear: () => void;
+  onResetProgress: () => void;
+  resetProgressDisabled: boolean;
+  resetProgressRecoveryRequired: boolean;
   onClearTemplates: () => void;
   clearTemplatesDisabled: boolean;
   templateActionsDisabled: boolean;
@@ -154,6 +185,8 @@ type Props = {
   onDownloadSelectedTemplates: () => void;
   onDeleteSelectedTemplates: () => void;
   onToggleRun: () => void;
+  onRetryDispatchPreflight: () => void;
+  onInspectDispatchIssue: (issue: TaskDispatchPreflightIssue) => void;
   onAdvance: () => void;
   onSelectTask: (task: Task) => void;
   onUpdateTaskParameters: (
@@ -175,6 +208,7 @@ type Props = {
   processLines: TaskProcessLogLine[];
   variableRows: TaskVariableRow[];
   logLines: TaskLogLine[];
+  logError: string;
   actionNodes: ActionNode[];
 };
 
@@ -195,9 +229,26 @@ function sampleRowStatusLabel(status: SampleProcessRowStatus) {
   return '排队';
 }
 
-function inheritsSampleS04Position(nodeId: string, parameter: string) {
-  return parameter === 'position'
-    && (nodeId === 'w04_run_stirring_s04' || nodeId === 'w06_pick_beaker_s04');
+function taskLogContext(
+  line: TaskLogLine,
+  taskById: Map<string, Task>,
+  templateById: Map<string, Template>,
+  actionById: Map<string, ActionNode>,
+  actionByTemplateNodeId: Map<string, ActionNode>,
+) {
+  const task = line.instanceId ? taskById.get(line.instanceId) : undefined;
+  const templateId = line.templateId || task?.templateId;
+  const template = templateId ? templateById.get(templateId) : undefined;
+  const action = line.nodeId
+    ? actionById.get(line.nodeId)
+      || (templateId ? actionByTemplateNodeId.get(`${templateId}:${line.nodeId}`) : undefined)
+    : undefined;
+  if (!line.sampleId && !task && !templateId && !line.nodeId && !line.executionId) return null;
+  return {
+    sampleLabel: line.sampleId || task?.sample,
+    taskLabel: template?.name || templateId,
+    actionLabel: action?.label || action?.method || line.nodeId,
+  };
 }
 
 type HeaderActionsProps = Pick<
@@ -205,6 +256,7 @@ type HeaderActionsProps = Pick<
   | 'environment'
   | 'isRunning'
   | 'isTransitioning'
+  | 'dispatchReadiness'
   | 'onEnvironmentChange'
   | 'onOpenSimulator'
   | 'onStartSimulator'
@@ -220,6 +272,12 @@ type HeaderActionsProps = Pick<
 
 export function TaskSchedulerHeaderActions(props: HeaderActionsProps) {
   const [isOpcConnectionOpen, setIsOpcConnectionOpen] = React.useState(false);
+  const dispatchReady = canStartTaskDispatch(props.dispatchReadiness);
+  const dispatchButtonState = props.isRunning
+    ? 'active'
+    : dispatchReady
+      ? 'ready'
+      : 'blocked';
 
   return (
     <>
@@ -246,7 +304,15 @@ export function TaskSchedulerHeaderActions(props: HeaderActionsProps) {
             <i className={props.opcConnected ? 'online' : ''} aria-hidden="true" />
             {props.opcConnected ? 'OPC 已连接' : '配置 OPC 连接'}
           </button>
-          <button className="scheduler-btn scheduler-btn--primary" disabled={props.isTransitioning} onClick={props.onToggleRun} type="button">
+          <button
+            aria-describedby="task-dispatch-readiness"
+            className={`scheduler-btn scheduler-btn--dispatch scheduler-btn--dispatch-${dispatchButtonState}`}
+            data-dispatch-state={dispatchButtonState}
+            disabled={props.isTransitioning || (!props.isRunning && !dispatchReady)}
+            onClick={props.onToggleRun}
+            title={props.isRunning ? '暂停后续 Task 派发' : taskDispatchButtonTitle(props.dispatchReadiness)}
+            type="button"
+          >
             {props.isRunning ? '暂停派发' : '开始派发'}
           </button>
         </div>
@@ -269,11 +335,35 @@ export function TaskSchedulerBench(props: Props) {
   const [parameterDraft, setParameterDraft] = React.useState<Record<string, Record<string, unknown>>>({});
   const [s09TipStatus, setS09TipStatus] = React.useState<S09TipStatus | null>(null);
   const [logFilter, setLogFilter] = React.useState<TaskLogCategory>('all');
+  const [errorStateFilter, setErrorStateFilter] = React.useState<TaskErrorStateFilter>('all');
   const [isFollowingLogs, setIsFollowingLogs] = React.useState(true);
   const [timingNowMs, setTimingNowMs] = React.useState(() => Date.now());
   const logContainerRef = React.useRef<HTMLDivElement>(null);
   const selected = props.tasks.find((task) => task.id === props.selectedTaskId) || props.tasks[0];
   const selectedTemplate = props.templates.find((template) => template.id === selected?.templateId);
+  const taskById = React.useMemo(
+    () => new Map(props.tasks.map((task) => [task.id, task])),
+    [props.tasks],
+  );
+  const templateById = React.useMemo(
+    () => new Map(props.templates.map((template) => [template.id, template])),
+    [props.templates],
+  );
+  const actionById = React.useMemo(
+    () => new Map(props.actionNodes.map((action) => [action.id, action])),
+    [props.actionNodes],
+  );
+  const actionByTemplateNodeId = React.useMemo(() => {
+    const resolvedActions = new Map<string, ActionNode>();
+    for (const template of props.templates) {
+      for (const resolved of resolveTemplateNodes(template.nodeIds, props.actionNodes)) {
+        if (resolved.node) {
+          resolvedActions.set(`${template.id}:${resolved.templateNodeId}`, resolved.node);
+        }
+      }
+    }
+    return resolvedActions;
+  }, [props.actionNodes, props.templates]);
   const hasRunningTasks = props.tasks.some((task) => task.status === 'running');
   const sampleProcessRows = React.useMemo(
     () => buildSampleProcessRows(props.tasks, props.templates, timingNowMs),
@@ -288,7 +378,11 @@ export function TaskSchedulerBench(props: Props) {
     ),
     [props.tasks, props.templates, props.actionNodes, timingNowMs],
   );
-  const visibleLogLines = props.logLines.filter((line) => logFilter === 'all' || line.category === logFilter);
+  const visibleLogLines = logFilter === 'error'
+    ? filterTaskErrorLines(props.logLines, errorStateFilter)
+    : filterTaskLogLines(props.logLines, logFilter);
+  const errorStateCounts = countTaskErrorStates(props.logLines);
+  const logCategoryCounts = countTaskLogCategories(props.logLines);
   const editingTemplate = props.templates.find((template) => template.id === editingTask?.templateId);
   const editingNodes: ResolvedActionNode[] = editingTemplate
     ? resolveTemplateNodes(editingTemplate.nodeIds, props.actionNodes)
@@ -299,6 +393,26 @@ export function TaskSchedulerBench(props: Props) {
   const editingS09Parameters = editingNodes.some((node) => node.method === 'add_liquid_with_reusable_tip');
   const allTemplatesSelected = props.templates.length > 0
     && props.templates.every((template) => props.scheduledTemplateIds.includes(template.id));
+  const dispatchReady = canStartTaskDispatch(props.dispatchReadiness);
+  const dispatchButtonState = props.isRunning
+    ? 'active'
+    : dispatchReady
+      ? 'ready'
+      : 'blocked';
+  const dispatchButtonTitle = props.isRunning
+    ? '暂停后续 Task 派发'
+    : taskDispatchButtonTitle(props.dispatchReadiness);
+  const dispatchReadinessDescription = props.dispatchReadiness.message || (
+    props.dispatchReadiness.status === 'validating'
+      ? '正在核对 Task 模板、可执行流程、设备和动作。'
+      : props.dispatchReadiness.status === 'ready'
+        ? '当前 Task 与可执行 workflow 匹配。'
+        : props.dispatchReadiness.status === 'invalid'
+          ? '请修复以下阻断项后重新派发。'
+          : props.dispatchReadiness.status === 'unavailable'
+            ? '暂时无法确认当前流程是否可以安全派发。'
+            : '流程或 Task 内容变化后会自动重新验证。'
+  );
 
   React.useEffect(() => {
     if (isFollowingLogs && logContainerRef.current) {
@@ -322,9 +436,24 @@ export function TaskSchedulerBench(props: Props) {
   }, [editingTask?.id, editingS09Parameters]);
 
   const exportLogs = () => {
-    const text = visibleLogLines.map((line) => (
-      `${new Date(line.timestamp).toLocaleString('zh-CN', { hour12: false })} [${line.category}] [${line.level}] ${line.message}`
-    )).join('\n');
+    const text = visibleLogLines.map((line) => {
+      const context = taskLogContext(
+        line,
+        taskById,
+        templateById,
+        actionById,
+        actionByTemplateNodeId,
+      );
+      const contextText = [
+        context?.sampleLabel ? `[样品 ${context.sampleLabel}; sample_id=${line.sampleId || ''}]` : '',
+        context?.taskLabel ? `[Task ${context.taskLabel}; instance_id=${line.instanceId || ''}]` : '',
+        context?.actionLabel
+          ? `[Action ${context.actionLabel}; node_id=${line.nodeId || ''}; execution_id=${line.executionId || ''}]`
+          : '',
+      ].filter(Boolean).join(' ');
+      const sequence = line.seq === undefined ? '' : ` #${line.seq}`;
+      return `${new Date(line.timestamp).toLocaleString('zh-CN', { hour12: false })}${sequence} ${formatTaskLogMetadata(line)}${contextText ? ` ${contextText}` : ''} ${line.message}`;
+    }).join('\n');
     void navigator.clipboard?.writeText(text).catch(() => undefined);
     const link = document.createElement('a');
     link.href = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
@@ -338,7 +467,7 @@ export function TaskSchedulerBench(props: Props) {
     setParameterDraft(Object.fromEntries(
       Object.entries(task.nodeParameters).map(([nodeId, parameters]) => [
         nodeId,
-        { ...parameters },
+        stripAutomaticallyManagedActionParameters(undefined, parameters, nodeId),
       ]),
     ));
   };
@@ -377,7 +506,7 @@ export function TaskSchedulerBench(props: Props) {
           <PanelHead title="本次测试配置" sub="定义要生成的测试队列" badge="草稿已保存" />
           <div className="scheduler-bench__section">
             <label>样品数</label>
-            <div className="scheduler-bench__sample-input"><input min="1" max="5" type="number" value={props.sampleCount} onChange={(event) => props.onSampleCountChange(Number(event.target.value))} /><button className="scheduler-btn scheduler-btn--primary" onClick={props.onGenerate} type="button">生成队列</button></div>
+            <div className="scheduler-bench__sample-input"><input min="1" max="999" type="number" value={props.sampleCount} onChange={(event) => props.onSampleCountChange(Number(event.target.value))} /><button className="scheduler-btn scheduler-btn--primary" onClick={props.onGenerate} type="button">生成队列</button></div>
             <div className="scheduler-bench__parameter-memory">
               <span>
                 {props.rememberedParameterCount
@@ -477,10 +606,86 @@ export function TaskSchedulerBench(props: Props) {
             <div className="scheduler-bench__queue-actions">
               <span>共 {props.tasks.length} 个 Task · {props.isRunning ? '正在派发' : '当前未派发'}</span>
               <div className="scheduler-bench__queue-buttons">
-                <button className="scheduler-btn scheduler-btn--ghost" onClick={props.onAdvance} type="button">调度一步</button>
-                <button className="scheduler-btn scheduler-btn--primary" onClick={props.onToggleRun} type="button">{props.isRunning ? '暂停后续派发' : '开始派发'}</button>
+                <button
+                  aria-describedby="task-dispatch-readiness"
+                  className="scheduler-btn scheduler-btn--ghost"
+                  disabled={props.isRunning || props.isTransitioning || !dispatchReady}
+                  onClick={props.onAdvance}
+                  title={dispatchReady ? '仅派发下一个可执行 Task' : taskDispatchButtonTitle(props.dispatchReadiness)}
+                  type="button"
+                >调度一步</button>
+                <button
+                  aria-describedby="task-dispatch-readiness"
+                  className={`scheduler-btn scheduler-btn--dispatch scheduler-btn--dispatch-${dispatchButtonState}`}
+                  data-dispatch-state={dispatchButtonState}
+                  disabled={props.isTransitioning || (!props.isRunning && !dispatchReady)}
+                  onClick={props.onToggleRun}
+                  title={dispatchButtonTitle}
+                  type="button"
+                >{props.isRunning ? '暂停后续派发' : '开始派发'}</button>
+                <button
+                  className="scheduler-btn scheduler-btn--ghost"
+                  disabled={props.resetProgressDisabled}
+                  onClick={props.onResetProgress}
+                  title={
+                    props.resetProgressDisabled
+                      ? '请先暂停派发'
+                      : props.resetProgressRecoveryRequired
+                        ? '确认真机动作已停止且 Task OPC 已断开后，清除残留执行并重置'
+                        : '保留 Task、顺序和参数，仅清除执行进度'
+                  }
+                  type="button"
+                >
+                  {props.resetProgressRecoveryRequired ? '清除残留并复用' : '重置并复用'}
+                </button>
                 <button className="scheduler-btn scheduler-btn--danger" onClick={props.onClear} type="button">清空队列</button>
               </div>
+            </div>
+            <div
+              aria-live="polite"
+              className={`scheduler-bench__dispatch-readiness ${props.dispatchReadiness.status}`}
+              id="task-dispatch-readiness"
+              role={props.dispatchReadiness.status === 'invalid' ? 'alert' : 'status'}
+            >
+              <div>
+                <i aria-hidden="true" />
+                <span>
+                  <strong>{taskDispatchReadinessLabel(props.dispatchReadiness)}</strong>
+                  <small>{dispatchReadinessDescription}</small>
+                </span>
+              </div>
+              {Boolean(props.dispatchReadiness.result?.errors.length) && (
+                <ul>
+                  {props.dispatchReadiness.result?.errors.map((issue, index) => (
+                    <li key={`${issue.code}:${issue.template_id}:${issue.node_id}:${index}`}>
+                      <button
+                        className="scheduler-bench__dispatch-issue"
+                        onClick={() => props.onInspectDispatchIssue(issue)}
+                        title="定位并处理此阻断项"
+                        type="button"
+                      >
+                        <code>{issue.code}</code>
+                        <div className="scheduler-bench__dispatch-issue-content">
+                          <span>{issue.message}</span>
+                          <small>处理建议：{taskDispatchIssueResolution(issue)}</small>
+                        </div>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {Boolean(props.dispatchReadiness.result?.warnings.length) && (
+                <p>另有 {props.dispatchReadiness.result?.warnings.length} 项警告，不阻止派发。</p>
+              )}
+              {(props.dispatchReadiness.status === 'invalid'
+                || props.dispatchReadiness.status === 'unavailable') && (
+                <button
+                  className="scheduler-btn scheduler-btn--ghost scheduler-bench__dispatch-retry"
+                  disabled={props.isRunning || props.isTransitioning}
+                  onClick={props.onRetryDispatchPreflight}
+                  type="button"
+                >重新检查</button>
+              )}
             </div>
             <div className="scheduler-bench__queue-wrap">
             <table className="scheduler-bench__queue"><thead><tr><th>样品</th><th>当前 Task</th><th>状态</th><th>等待原因</th></tr></thead><tbody>{props.tasks.map((task) => {
@@ -492,7 +697,8 @@ export function TaskSchedulerBench(props: Props) {
           </section>
           <section className="scheduler-bench__panel scheduler-bench__progress">
             <PanelHead title="样品进度缩略图" badge="仅显示" />
-            {sampleProcessRows.map((row) => {
+            <div className="scheduler-bench__progress-body">
+              {sampleProcessRows.map((row) => {
               const rowStatus = sampleProcessRowStatus(row.blocks);
               const timing = timingSummaries.samples.get(row.sample);
               return (
@@ -562,7 +768,11 @@ export function TaskSchedulerBench(props: Props) {
                   </small>
                 </div>
               );
-            })}
+              })}
+              {!sampleProcessRows.length && (
+                <p className="scheduler-bench__empty">生成队列后显示各样品的工艺进度。</p>
+              )}
+            </div>
           </section>
         </section>
 
@@ -570,27 +780,60 @@ export function TaskSchedulerBench(props: Props) {
           <section className="scheduler-bench__panel">
             <PanelHead title="运行日志" sub="调度、Action 与 OPC 条件的实时输出" badge="实时" />
             <div className="scheduler-bench__log-head"><button className="scheduler-bench__follow" onClick={() => setIsFollowingLogs((value) => !value)} type="button">● {isFollowingLogs ? '正在跟随最新日志' : '已暂停自动跟随'}</button><button onClick={exportLogs} type="button">导出</button></div>
+            {props.logError && <div className="scheduler-bench__log-error" role="alert">日志读取异常：{props.logError}</div>}
             <div className="scheduler-bench__filters">{([
-              ['all', '全部'],
-              ['schedule', '调度'],
-              ['action', 'Action'],
-              ['opc', 'OPC'],
-              ['error', '动作结果'],
-            ] as const).map(([filter, label]) => <button className={logFilter === filter ? 'active' : ''} key={filter} onClick={() => setLogFilter(filter)} type="button">{label}</button>)}</div>
+              ['all', '全部', logCategoryCounts.all],
+              ['schedule', '调度', logCategoryCounts.schedule],
+              ['action', 'Action', logCategoryCounts.action],
+              ['opc', 'OPC', logCategoryCounts.opc],
+              ['result', '结果', logCategoryCounts.result],
+              ['error', '错误', logCategoryCounts.error],
+            ] as const).map(([filter, label, count]) => <button className={logFilter === filter ? 'active' : ''} data-active-errors={filter === 'error' && logCategoryCounts.activeErrors > 0 ? 'true' : undefined} key={filter} onClick={() => setLogFilter(filter)} type="button"><span>{label}</span><b>{count}</b>{filter === 'error' && logCategoryCounts.activeErrors > 0 && <em>{logCategoryCounts.activeErrors} 未恢复</em>}</button>)}</div>
+            {logFilter === 'error' && <div className="scheduler-bench__filters scheduler-bench__error-filters" role="group" aria-label="错误状态筛选">{([
+              ['all', '全部错误', errorStateCounts.total],
+              ['active', '当前异常', errorStateCounts.active],
+              ['recovered', '已恢复', errorStateCounts.recovered],
+            ] as const).map(([filter, label, count]) => <button aria-pressed={errorStateFilter === filter} className={errorStateFilter === filter ? 'active' : ''} data-error-state={filter} key={filter} onClick={() => setErrorStateFilter(filter)} type="button">{label} <b>{count}</b></button>)}</div>}
             <div className="scheduler-bench__log" onScroll={(event) => {
               const element = event.currentTarget;
               setIsFollowingLogs(element.scrollHeight - element.scrollTop - element.clientHeight < 12);
             }} ref={logContainerRef}>
-              {visibleLogLines.map((line) => <div className={`scheduler-bench__log-line ${line.category}`} key={line.id}>
-                <div><time>{new Date(line.timestamp).toLocaleTimeString('zh-CN', { hour12: false })}</time> [{line.level}] {line.message}</div>
-                {line.detail && Object.keys(line.detail).length ? <details>
-                  <summary>详情</summary>
-                  <pre>{JSON.stringify(line.detail, null, 2)}</pre>
-                </details> : null}
-              </div>)}
+              {visibleLogLines.map((line) => {
+                const context = taskLogContext(
+                  line,
+                  taskById,
+                  templateById,
+                  actionById,
+                  actionByTemplateNodeId,
+                );
+                const isRecovery = isTaskLogRecovery(line);
+                return <div className={`scheduler-bench__log-line ${line.category}${line.isError ? ' error' : ''}`} key={line.id}>
+                  {context && <div className="scheduler-bench__log-context">
+                    {context.sampleLabel && <span title={`sample_id: ${line.sampleId || ''}`}>样品 · {context.sampleLabel}</span>}
+                    {context.taskLabel && <span title={`instance_id: ${line.instanceId || ''}`}>Task · {context.taskLabel}</span>}
+                    {context.actionLabel && <span title={`node_id: ${line.nodeId || ''}\nexecution_id: ${line.executionId || ''}`}>Action · {context.actionLabel}</span>}
+                  </div>}
+                  <div className="scheduler-bench__log-content">
+                    {line.seq === undefined ? null : <span className="scheduler-bench__log-sequence">#{line.seq}</span>}
+                    <time>{new Date(line.timestamp).toLocaleTimeString('zh-CN', { hour12: false })}</time>
+                    <span className="scheduler-bench__log-meta category" title={`category: ${line.category}`}>{taskLogCategoryLabel(line.category)}</span>
+                    <span className={`scheduler-bench__log-meta level ${line.level.toLowerCase()}`}>{line.level.toUpperCase()}</span>
+                    {line.code && <code className="scheduler-bench__log-meta code" title={`code: ${line.code}`}>{line.code}</code>}
+                    {line.phase && !isRecovery && <span className="scheduler-bench__log-meta phase" title={`phase: ${line.phase}`}>{taskLogPhaseLabel(line.phase)}</span>}
+                    {line.errorState === 'active' && <span className="scheduler-bench__log-meta active-error">当前异常</span>}
+                    {line.errorState === 'recovered' && <span className="scheduler-bench__log-meta recovered" title={`恢复时间: ${new Date(line.recoveredAt || line.timestamp).toLocaleTimeString('zh-CN', { hour12: false })}`}>后来已恢复</span>}
+                    {isRecovery && <span className="scheduler-bench__log-meta recovered" title={`phase: ${line.phase || 'recovered'}`}>已恢复</span>}
+                    <span className="scheduler-bench__log-message">{line.message}</span>
+                  </div>
+                  {line.detail && Object.keys(line.detail).length ? <details>
+                    <summary>详情</summary>
+                    <pre>{JSON.stringify(line.detail, null, 2)}</pre>
+                  </details> : null}
+                </div>;
+              })}
               {!visibleLogLines.length && <div>本次启动后暂无匹配日志。</div>}
             </div>
-            <div className="scheduler-bench__log-foot">本次启动后 {visibleLogLines.length} 条 · {isFollowingLogs ? '自动滚动' : '滚动已暂停'}</div>
+            <div className="scheduler-bench__log-foot">本次启动后 {props.logLines.length} 条{logFilter === 'all' ? '' : ` · 当前筛选 ${visibleLogLines.length} 条`} · {isFollowingLogs ? '自动滚动' : '滚动已暂停'}</div>
           </section>
           <section className="scheduler-bench__panel scheduler-bench__detail">
             <div className="scheduler-bench__detail-tabs"><button className="active" type="button">选中 Task 条件</button></div>
@@ -664,7 +907,7 @@ export function TaskSchedulerBench(props: Props) {
                             <span>{label}</span>
                             <input
                               disabled={!parametersEditable}
-                              min={type === 'number' ? (field === 'target_weight' ? 0 : 1) : undefined}
+                              min={type === 'number' ? 0 : undefined}
                               max={type === 'number' && field !== 'target_weight' ? 10 : undefined}
                               onChange={(event) => {
                                 const next = additions.map((item, index) => index === additionIndex
@@ -685,11 +928,11 @@ export function TaskSchedulerBench(props: Props) {
                     const additions = liquidAdditionsFromValues(values);
                     return <div className="scheduler-bench__powder-additions">
                       <label>
-                        <span>液体种类数 · 测密度前需要依次加入的液体数量</span>
+                        <span>液体种类数 · 本次加液动作需要依次加入的液体数量</span>
                         <input disabled={!parametersEditable} min={1} onChange={(event) => {
                           const count = Math.max(1, Math.floor(Number(event.target.value) || 1));
                           const next = additions.slice(0, count);
-                          while (next.length < count) next.push({ liquid_station_index: 1, solvent_batch_id: '', volume: '' });
+                          while (next.length < count) next.push({ liquid_station_index: 1, solvent_batch_id: '', volume: '', reuse_tip: true });
                           updateLiquidAdditions(node.templateNodeId, next);
                         }} step={1} type="number" value={additions.length} />
                       </label>
@@ -707,6 +950,12 @@ export function TaskSchedulerBench(props: Props) {
                               ? { ...item, [field]: event.target.value } : item))}
                             step={field === 'liquid_station_index' ? 1 : 'any'} type={type} value={String(addition[field] ?? '')} />
                         </label>)}
+                        <label>
+                          <span>复用此液体 TIP · 取消勾选时使用新 TIP</span>
+                          <input checked={addition.reuse_tip} disabled={!parametersEditable}
+                            onChange={(event) => updateLiquidAdditions(node.templateNodeId, additions.map((item, index) => index === additionIndex
+                              ? { ...item, reuse_tip: event.target.checked } : item))} type="checkbox" />
+                        </label>
                       </fieldset>)}
                       <label>
                         <span>执行前初始化 TIP 库存 · 会覆盖当前 TIP 使用和绑定记录</span>
@@ -727,9 +976,9 @@ export function TaskSchedulerBench(props: Props) {
                   )).map((spec) => {
                     const name = spec.name as string;
                     const value = values[name];
-                    if (inheritsSampleS04Position(node.templateNodeId, name)) {
+                    if (isAutomaticallyManagedActionParameter(node.method, name, node.templateNodeId)) {
                       return <p className="scheduler-bench__inherited-parameter" key={name}>
-                        磁搅位置 · 自动沿用同一样品在「S04 放烧杯」中选择的位置
+                        {automaticActionParameterDescription(node.method, name, node.templateNodeId)}
                       </p>;
                     }
                     const inputType = spec.type === 'boolean' ? 'checkbox' : spec.type === 'integer' || spec.type === 'number' ? 'number' : 'text';
@@ -765,7 +1014,7 @@ export function TaskSchedulerBench(props: Props) {
                 <p className="scheduler-bench__empty">
                   该 Task 未找到可编辑的 Action 节点。
                   {props.actionNodes.length === 0
-                    ? '请先在流程设计画布导入 Flow JSON（如 szlab_robot_action_workflow_flow.json）。'
+                    ? '请先在流程设计画布导入 Flow JSON（如 szlab_robot_action_workflow.json）。'
                     : `模板节点（${editingTemplate.nodeIds.join('、')}）与当前画布节点 ID 不一致；请重新导入对应 Flow JSON 或检查画布是否为空。`}
                 </p>
               )}

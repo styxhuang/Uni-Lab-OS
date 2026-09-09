@@ -6,7 +6,18 @@ import threading
 import time
 from typing import Any
 
-MAX_ENTRIES_PER_EXECUTION = 200
+
+TASK_EXECUTION_LOG_CATEGORIES = frozenset({"schedule", "action", "opc", "result"})
+TASK_EXECUTION_LOG_LEVELS = frozenset(
+    {"debug", "info", "warning", "error", "critical"}
+)
+
+
+def _normalize_contract_value(
+    value: str, allowed: frozenset[str], default: str
+) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in allowed else default
 
 
 class TaskActionLogStore:
@@ -28,6 +39,12 @@ class TaskActionLogStore:
         level: str,
         message: str,
         detail: dict[str, Any] | None = None,
+        category: str = "action",
+        code: str = "",
+        phase: str = "",
+        template_id: str = "",
+        device_id: str = "",
+        action_name: str = "",
     ) -> int:
         if not workflow_path:
             return self.latest_seq(workflow_path)
@@ -37,7 +54,17 @@ class TaskActionLogStore:
             "node_id": node_id,
             "execution_id": execution_id,
             "sample_id": sample_id,
-            "level": level or "info",
+            "template_id": template_id,
+            "device_id": device_id,
+            "action_name": action_name,
+            "category": _normalize_contract_value(
+                category, TASK_EXECUTION_LOG_CATEGORIES, "action"
+            ),
+            "level": _normalize_contract_value(
+                level, TASK_EXECUTION_LOG_LEVELS, "info"
+            ),
+            "code": str(code or "").strip(),
+            "phase": str(phase or "").strip(),
             "message": message or "",
             "detail": dict(detail or {}),
         }
@@ -45,9 +72,7 @@ class TaskActionLogStore:
             next_seq = self._seq_by_workflow.get(workflow_path, 0) + 1
             self._seq_by_workflow[workflow_path] = next_seq
             record["seq"] = next_seq
-            entries = self._entries_by_workflow.setdefault(workflow_path, [])
-            entries.append(record)
-            self._trim_execution_entries(entries, execution_id)
+            self._entries_by_workflow.setdefault(workflow_path, []).append(record)
             return next_seq
 
     def latest_seq(self, workflow_path: str) -> int:
@@ -71,18 +96,13 @@ class TaskActionLogStore:
             if int(item.get("seq", 0)) > after_seq
             and (not instance_id or item.get("instance_id") == instance_id)
         ]
-        if limit > 0:
-            filtered = filtered[-limit:]
-        return {"latest_seq": latest, "entries": filtered}
-
-    @staticmethod
-    def _trim_execution_entries(
-        entries: list[dict[str, Any]],
-        execution_id: str,
-    ) -> None:
-        same = [item for item in entries if item.get("execution_id") == execution_id]
-        overflow = len(same) - MAX_ENTRIES_PER_EXECUTION
-        if overflow <= 0:
-            return
-        remove_ids = {id(item) for item in same[:overflow]}
-        entries[:] = [item for item in entries if id(item) not in remove_ids]
+        page = filtered[:limit] if limit > 0 else filtered
+        next_after_seq = (
+            int(page[-1].get("seq", after_seq)) if page else int(after_seq)
+        )
+        return {
+            "latest_seq": latest,
+            "next_after_seq": next_after_seq,
+            "has_more": len(page) < len(filtered),
+            "entries": page,
+        }

@@ -121,6 +121,39 @@
   color: #ffffff;
 }
 
+.scheduler-btn--dispatch-blocked,
+.scheduler-btn--dispatch-blocked:disabled {
+  border-color: #cbd5e1;
+  background: #e2e8f0;
+  color: #64748b;
+  opacity: 1;
+}
+
+.scheduler-btn--dispatch-ready {
+  border-color: #15803d;
+  background: var(--green);
+  color: #ffffff;
+  box-shadow: 0 0 0 2px rgba(22, 163, 74, 0.12);
+}
+
+.scheduler-btn--dispatch-ready:hover:not(:disabled) {
+  border-color: #166534;
+  background: #15803d;
+  color: #ffffff;
+}
+
+.scheduler-btn--dispatch-active {
+  border-color: #1d4ed8;
+  background: var(--blue);
+  color: #ffffff;
+}
+
+.scheduler-btn--dispatch-active:hover:not(:disabled) {
+  border-color: #1e40af;
+  background: #1d4ed8;
+  color: #ffffff;
+}
+
 .scheduler-btn--accent {
   border-color: #0ea5e9;
   background: #0ea5e9;
@@ -268,7 +301,8 @@
 }
 
 .scheduler-bench__middle {
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-rows: minmax(240px, 1fr) minmax(140px, 32vh);
+  overflow: hidden;
 }
 
 .scheduler-bench__right {
@@ -300,6 +334,7 @@
 
 .scheduler-bench__panel-head {
   display: flex;
+  flex: 0 0 auto;
   justify-content: space-between;
   align-items: flex-start;
   gap: 10px;
@@ -617,6 +652,7 @@
 /* ── Queue ── */
 .scheduler-bench__queue-actions {
   display: flex;
+  flex: 0 0 auto;
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
@@ -639,12 +675,175 @@
   gap: 6px;
 }
 
+.scheduler-bench__dispatch-readiness {
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--line);
+  background: #f8fafc;
+  color: #475569;
+  padding: 9px 16px;
+}
+
+.scheduler-bench__dispatch-readiness > div {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.scheduler-bench__dispatch-readiness i {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #94a3b8;
+  box-shadow: 0 0 0 3px #e2e8f0;
+}
+
+.scheduler-bench__dispatch-readiness span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.scheduler-bench__dispatch-readiness strong {
+  color: #334155;
+  font-size: 12px;
+}
+
+.scheduler-bench__dispatch-readiness small {
+  color: #64748b;
+  font-size: 11px;
+}
+
+.scheduler-bench__dispatch-readiness.validating {
+  background: var(--blue-bg);
+}
+
+.scheduler-bench__dispatch-readiness.validating i {
+  background: var(--blue);
+  box-shadow: 0 0 0 3px #dbeafe;
+  animation: scheduler-readiness-pulse 900ms ease-in-out infinite alternate;
+}
+
+.scheduler-bench__dispatch-readiness.ready {
+  background: var(--green-bg);
+}
+
+.scheduler-bench__dispatch-readiness.ready i {
+  background: var(--green);
+  box-shadow: 0 0 0 3px #dcfce7;
+}
+
+.scheduler-bench__dispatch-readiness.ready strong { color: #166534; }
+
+.scheduler-bench__dispatch-readiness.invalid {
+  background: var(--red-bg);
+}
+
+.scheduler-bench__dispatch-readiness.invalid i {
+  background: var(--red);
+  box-shadow: 0 0 0 3px #fee2e2;
+}
+
+.scheduler-bench__dispatch-readiness.invalid strong { color: #991b1b; }
+
+.scheduler-bench__dispatch-readiness.unavailable {
+  background: var(--amber-bg);
+}
+
+.scheduler-bench__dispatch-readiness.unavailable i {
+  background: var(--amber);
+  box-shadow: 0 0 0 3px #fef3c7;
+}
+
+.scheduler-bench__dispatch-readiness.unavailable strong { color: #92400e; }
+
+.scheduler-bench__dispatch-readiness ul {
+  display: grid;
+  gap: 4px;
+  margin: 8px 0 0 18px;
+  padding: 0;
+  list-style: none;
+}
+
+.scheduler-bench__dispatch-readiness li {
+  color: #7f1d1d;
+  font-size: 11px;
+}
+
+.scheduler-bench__dispatch-issue {
+  display: flex;
+  width: 100%;
+  align-items: baseline;
+  gap: 7px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  padding: 3px 4px;
+  text-align: left;
+}
+
+.scheduler-bench__dispatch-issue:hover,
+.scheduler-bench__dispatch-issue:focus-visible {
+  background: rgba(220, 38, 38, 0.08);
+  outline: none;
+}
+
+.scheduler-bench__dispatch-issue:focus-visible {
+  box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.18);
+}
+
+.scheduler-bench__dispatch-issue-content {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.scheduler-bench__dispatch-issue-content > span {
+  display: block;
+}
+
+.scheduler-bench__dispatch-issue-content > small {
+  color: #64748b;
+  line-height: 1.35;
+}
+
+.scheduler-bench__dispatch-readiness code {
+  flex: 0 0 auto;
+  border-radius: 4px;
+  background: rgba(220, 38, 38, 0.09);
+  color: #991b1b;
+  padding: 1px 4px;
+  font-size: 10px;
+}
+
+.scheduler-bench__dispatch-readiness p {
+  margin: 6px 0 0 18px;
+  color: #92400e;
+  font-size: 10px;
+}
+
+.scheduler-bench__dispatch-retry {
+  align-self: flex-start;
+  margin-top: 10px;
+}
+
+@keyframes scheduler-readiness-pulse {
+  from { opacity: 0.45; }
+  to { opacity: 1; }
+}
+
 .scheduler-bench table { width: 100%; border-collapse: collapse; }
 
 .scheduler-bench__queue-wrap {
-  flex: 1;
+  flex: 1 1 0;
   min-height: 0;
-  overflow: auto;
+  overscroll-behavior: contain;
+  overflow-x: auto;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .scheduler-bench__queue {
@@ -742,6 +941,15 @@
 
 /* ── Progress ── */
 .scheduler-bench__progress .scheduler-bench__panel-head { padding: 10px 16px; }
+
+.scheduler-bench__progress-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overscroll-behavior: contain;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
 
 .scheduler-bench__progress-row {
   display: grid;
@@ -920,6 +1128,14 @@
 
 .scheduler-bench__log-head .scheduler-bench__follow { color: var(--green); text-decoration: none; }
 
+.scheduler-bench__log-error {
+  border-bottom: 1px solid #7f1d1d;
+  background: #450a0a;
+  color: #fecaca;
+  font-size: 11px;
+  padding: 8px 16px;
+}
+
 .scheduler-bench__filters {
   display: flex;
   flex-wrap: wrap;
@@ -938,10 +1154,59 @@
   padding: 4px 10px;
 }
 
+.scheduler-bench__filters button b {
+  min-width: 14px;
+  border-radius: 999px;
+  background: #e2e8f0;
+  color: #475569;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  padding: 1px 4px;
+}
+
+.scheduler-bench__filters button em {
+  color: var(--red);
+  font-size: 9px;
+  font-style: normal;
+}
+
+.scheduler-bench__filters button[data-active-errors='true'] {
+  border-color: #fca5a5;
+  color: var(--red);
+}
+
 .scheduler-bench__filters button.active {
   border-color: #93c5fd;
   background: var(--blue-bg);
   color: var(--blue-text);
+}
+
+.scheduler-bench__filters button.active[data-active-errors='true'] {
+  border-color: #f87171;
+  background: var(--red-bg);
+  color: var(--red);
+}
+
+.scheduler-bench__error-filters {
+  padding-top: 0;
+  background: #f8fafc;
+}
+
+.scheduler-bench__error-filters button b {
+  margin-left: 3px;
+  font-variant-numeric: tabular-nums;
+}
+
+.scheduler-bench__error-filters button.active[data-error-state='active'] {
+  border-color: #fca5a5;
+  background: var(--red-bg);
+  color: var(--red);
+}
+
+.scheduler-bench__error-filters button.active[data-error-state='recovered'] {
+  border-color: #86efac;
+  background: var(--green-bg);
+  color: var(--green);
 }
 
 .scheduler-bench__log {
@@ -959,6 +1224,53 @@
   border-bottom: 1px solid #1e293b;
 }
 
+.scheduler-bench__log-context {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 4px;
+}
+
+.scheduler-bench__log-context span {
+  border: 1px solid #334155;
+  border-radius: 999px;
+  background: #1e293b;
+  color: #cbd5e1;
+  font-size: 9px;
+  padding: 1px 6px;
+}
+
+.scheduler-bench__log-sequence { color: #94a3b8; }
+
+.scheduler-bench__log-content {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.scheduler-bench__log-meta {
+  display: inline-flex;
+  align-items: center;
+  min-height: 17px;
+  border: 1px solid #334155;
+  border-radius: 5px;
+  background: #1e293b;
+  color: #cbd5e1;
+  font: 9px/1 ui-monospace, SFMono-Regular, Consolas, monospace;
+  padding: 2px 5px;
+}
+
+.scheduler-bench__log-meta.category { color: #bfdbfe; }
+.scheduler-bench__log-meta.level.error,
+.scheduler-bench__log-meta.level.critical { border-color: #7f1d1d; background: #450a0a; color: #fecaca; }
+.scheduler-bench__log-meta.level.warning { border-color: #78350f; background: #451a03; color: #fde68a; }
+.scheduler-bench__log-meta.code { color: #e2e8f0; }
+.scheduler-bench__log-meta.phase { color: #c4b5fd; }
+.scheduler-bench__log-meta.active-error { border-color: #7f1d1d; background: #450a0a; color: #fecaca; }
+.scheduler-bench__log-meta.recovered { border-color: #14532d; background: #052e16; color: #86efac; }
+.scheduler-bench__log-message { margin-left: 2px; }
+
 .scheduler-bench__log-line details { margin: 5px 0 0 54px; }
 .scheduler-bench__log-line summary { color: #94a3b8; cursor: pointer; }
 .scheduler-bench__log-line pre {
@@ -973,6 +1285,8 @@
 }
 
 .scheduler-bench__log .scheduler-bench__log-line.opc { color: #7dd3fc; }
+
+.scheduler-bench__log .scheduler-bench__log-line.result { color: #86efac; }
 
 .scheduler-bench__log .scheduler-bench__log-line.error { color: #fca5a5; }
 

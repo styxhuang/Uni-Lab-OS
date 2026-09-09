@@ -32,7 +32,7 @@
   "default_config": {
     "graph": "__generated__",
     "url": "opc.tcp://192.168.1.10:4840",
-    "csv": "szlab_plc_0721.csv",
+    "csv": "szlab_plc_0810.csv",
     "task_sample_start_interval_seconds": 1,
     "no_subscription": true,
     "show_csv": false,
@@ -43,9 +43,6 @@
     ]
   },
   "debug_config": {
-    "env": {
-      "SKIP_SENSOR_PRECHECK": "1"
-    },
     "skip_robot_precheck_variables": [
       "Robot_Home",
       "传感器状态_上位机[0].NO[0]",
@@ -96,7 +93,6 @@
       "传感器状态_上位机[2].NO[13]",
       "传感器状态_上位机[2].NO[14]",
       "传感器状态_上位机[2].NO[15]",
-      "传感器状态_上位机[3].NO[0]",
       "传感器状态_上位机[3].NO[1]",
       "传感器状态_上位机[3].NO[6]",
       "传感器状态_上位机[3].NO[8]",
@@ -212,7 +208,8 @@
         },
         "config": {
           "plc_device_id": "szlab_poly_plc",
-          "busy_variable_name": "机器人Busy信号"
+          "busy_variable_name": "机器人Busy信号",
+          "enable_gripper_check": true
         },
         "data": {}
       },

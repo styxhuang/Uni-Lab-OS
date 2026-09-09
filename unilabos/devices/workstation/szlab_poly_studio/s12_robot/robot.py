@@ -12,6 +12,7 @@ from unilabos.devices.workstation.szlab_poly_studio.s12_robot.robot_tasks import
     ROBOT_TASK_NUMBER_VARIABLE,
     ROBOT_WRITE_ALLOWED_VARIABLE,
     ROBOT_WRITE_DONE_VARIABLE,
+    S05_MATERIAL_SENSOR,
 )
 from unilabos.devices.workstation.szlab_poly_studio.s12_robot.robot_S01 import SzlabRobotS01Mixin
 from unilabos.devices.workstation.szlab_poly_studio.s12_robot.robot_S02 import SzlabRobotS02Mixin
@@ -24,6 +25,21 @@ from unilabos.devices.workstation.szlab_poly_studio.s12_robot.robot_S08 import S
 from unilabos.devices.workstation.szlab_poly_studio.s12_robot.robot_S09 import SzlabRobotS09Mixin
 from unilabos.devices.workstation.szlab_poly_studio.s12_robot.robot_S10 import SzlabRobotS10Mixin
 from unilabos.devices.workstation.szlab_poly_studio.s12_robot.robot_S11 import SzlabRobotS11Mixin
+
+
+GRIPPER_ORIGIN_VARIABLE = "Robot_夹爪.原点位"
+GRIPPER_STATUS_VARIABLE = "Robot_夹爪.夹爪状态"
+GRIPPER_POSITION_VARIABLES = {
+    "tip_box": "Robot_夹爪.TIP盒位",
+    "beaker": "Robot_夹爪.烧杯位",
+    "sample_vial_250ml": "Robot_夹爪.样品瓶250ml位",
+    "sample_vial_500ml": "Robot_夹爪.样品瓶500ml位",
+    "liquid_reagent_100ml": "Robot_夹爪.液体试剂瓶100ml位",
+    "solid_powder": "Robot_夹爪.固体粉末位",
+}
+
+# S05 是单工位，错误放料会直接造成叠料；即使在调试模式也不能绕过该门禁。
+_NON_SKIPPABLE_ROBOT_SENSOR_VARIABLES = frozenset({S05_MATERIAL_SENSOR})
 
 
 @device(
@@ -50,12 +66,14 @@ class SzlabMixerRobotDevice(
         plc_device_id: str = "szlab_poly_plc",
         poll_interval: float = 1.0,
         write_done_hold_seconds: float = 0.0,
+        enable_gripper_check: bool = False,
         *args,
         **kwargs,
     ):
         self.plc_device_id = plc_device_id
         self.poll_interval = float(poll_interval)
         self.write_done_hold_seconds = float(write_done_hold_seconds)
+        self.enable_gripper_check = bool(enable_gripper_check)
         self._plc_gateway = None
         self._last_task: dict[str, Any] = {}
 
@@ -76,6 +94,11 @@ class SzlabMixerRobotDevice(
         return self._plc_gateway.read_variable(name, use_cache=use_cache)
 
     @not_action
+    def _plc_alarm_active(self) -> bool:
+        checker = getattr(self._plc_gateway, "_mixing_wait_should_abort", None)
+        return bool(checker()) if callable(checker) else False
+
+    @not_action
     def _wait_variable_equal(
         self,
         name: str,
@@ -88,6 +111,8 @@ class SzlabMixerRobotDevice(
 
         poll_interval = self.poll_interval if interval is None else interval
         while True:
+            if self._plc_alarm_active():
+                return False
             if self._read_variable(name, use_cache=False) == expected:
                 return True
             time.sleep(poll_interval)
@@ -106,6 +131,8 @@ class SzlabMixerRobotDevice(
 
         last_value = None
         while True:
+            if self._plc_alarm_active():
+                return False, last_value
             last_value = self._read_variable(name, use_cache=False)
             if bool(last_value):
                 return True, last_value
@@ -113,7 +140,10 @@ class SzlabMixerRobotDevice(
 
     @not_action
     def _ensure_sensor_gate(self, sensor_variable: str, expected: bool, message: str) -> dict[str, Any] | None:
-        if os.environ.get("SKIP_SENSOR_PRECHECK") == "1":
+        if (
+            os.environ.get("SKIP_SENSOR_PRECHECK") == "1"
+            and sensor_variable not in _NON_SKIPPABLE_ROBOT_SENSOR_VARIABLES
+        ):
             return None
         if not sensor_variable:
             return {"success": False, "message": "缺少精确传感器变量，不能执行机器人取放料动作"}
@@ -137,7 +167,10 @@ class SzlabMixerRobotDevice(
         *,
         phase: str,
     ) -> dict[str, Any]:
-        if os.environ.get("SKIP_SENSOR_PRECHECK") == "1":
+        if (
+            os.environ.get("SKIP_SENSOR_PRECHECK") == "1"
+            and not _NON_SKIPPABLE_ROBOT_SENSOR_VARIABLES.intersection(conditions)
+        ):
             return {
                 "success": True,
                 "phase": phase,
@@ -222,6 +255,151 @@ class SzlabMixerRobotDevice(
         return {}, {}
 
     @not_action
+    def _gripper_position_variable(self, task: str, station: str, data: dict[str, Any]) -> str:
+        if station == "S08" and task == "pour":
+            # 全流程中 S08 倒料时机械臂始终夹持烧杯；product_type 表示样品瓶规格。
+            return GRIPPER_POSITION_VARIABLES["beaker"]
+        if station == "S01":
+            product_map = {
+                1: "tip_box",
+                2: "beaker",
+                3: "sample_vial_250ml",
+                4: "sample_vial_500ml",
+                5: "liquid_reagent_100ml",
+                6: "solid_powder",
+            }
+        elif station == "S02":
+            return GRIPPER_POSITION_VARIABLES["tip_box"]
+        elif station in {"S03", "S11"}:
+            product_map = {1: "beaker", 2: "sample_vial_250ml", 3: "sample_vial_500ml"}
+        elif station in {"S04", "S05", "S06"}:
+            return GRIPPER_POSITION_VARIABLES["beaker"]
+        elif station == "S071":
+            return GRIPPER_POSITION_VARIABLES["solid_powder"]
+        elif station == "S072":
+            product_map = {1: "solid_powder", 2: "beaker"}
+        elif station == "S08":
+            product_map = {1: "sample_vial_250ml", 2: "sample_vial_500ml", 3: "liquid_reagent_100ml"}
+        elif station == "S09":
+            product_map = {1: "tip_box", 2: "liquid_reagent_100ml", 3: "beaker", 4: "beaker"}
+        elif station == "S10":
+            return GRIPPER_POSITION_VARIABLES["liquid_reagent_100ml"]
+        else:
+            raise ValueError(f"未配置 {station} {task} 的夹爪位置")
+
+        product_type = int(data.get("product_type", 0))
+        if product_type not in product_map:
+            raise ValueError(f"{station} 夹爪检查不支持 product_type={product_type}")
+        return GRIPPER_POSITION_VARIABLES[product_map[product_type]]
+
+    @not_action
+    def _gripper_requirements(
+        self,
+        task: str,
+        station: str,
+        data: dict[str, Any],
+    ) -> tuple[tuple[str, tuple[int, ...]] | None, tuple[str, tuple[int, ...]] | None]:
+        if not self.enable_gripper_check:
+            return None, None
+        product_position = self._gripper_position_variable(task, station, data)
+        empty = (GRIPPER_ORIGIN_VARIABLE, (1,))
+        holding = (product_position, (1, 2))
+        if task == "pick":
+            return empty, holding
+        if task == "place":
+            return holding, empty
+        if task == "pour":
+            return holding, holding
+        return None, None
+
+    @not_action
+    def _wait_gripper_requirement(
+        self,
+        requirement: tuple[str, tuple[int, ...]],
+        *,
+        phase: str,
+    ) -> dict[str, Any]:
+        position_variable, allowed_statuses = requirement
+        conditions: dict[str, Any] = {
+            position_variable: True,
+            GRIPPER_STATUS_VARIABLE: {"one_of": list(allowed_statuses)},
+        }
+        if os.environ.get("SKIP_SENSOR_PRECHECK") == "1":
+            return {
+                "success": True,
+                "phase": phase,
+                "skipped": True,
+                "message": "已跳过机器人夹爪检查",
+                "conditions": conditions,
+                "values": {},
+            }
+
+        skip_position = self._should_skip_robot_precheck_variable(position_variable)
+        skip_status = self._should_skip_robot_precheck_variable(GRIPPER_STATUS_VARIABLE)
+        if skip_position and skip_status:
+            return {
+                "success": True,
+                "phase": phase,
+                "skipped": True,
+                "message": "配置中的夹爪信号均已跳过",
+                "conditions": conditions,
+                "values": {},
+            }
+
+        values: dict[str, Any] = {}
+        while True:
+            if self._plc_alarm_active():
+                return {
+                    "success": False,
+                    "phase": phase,
+                    "message": "PLC 报警已中止机器人夹爪等待",
+                    "conditions": conditions,
+                    "values": values,
+                }
+            values = {}
+            status_value = None
+            if not skip_status:
+                status_value = int(self._read_variable(GRIPPER_STATUS_VARIABLE, use_cache=False))
+                values[GRIPPER_STATUS_VARIABLE] = status_value
+                if status_value == 3:
+                    return {
+                        "success": False,
+                        "phase": phase,
+                        "message": "夹爪状态为 3，检测到物料掉落",
+                        "conditions": conditions,
+                        "values": values,
+                        "mismatches": {
+                            GRIPPER_STATUS_VARIABLE: {
+                                "expected": list(allowed_statuses),
+                                "actual": status_value,
+                            }
+                        },
+                    }
+                if status_value not in {0, 1, 2}:
+                    return {
+                        "success": False,
+                        "phase": phase,
+                        "message": f"未知夹爪状态: {status_value}",
+                        "conditions": conditions,
+                        "values": values,
+                    }
+
+            position_value = True
+            if not skip_position:
+                position_value = bool(self._read_variable(position_variable, use_cache=False))
+                values[position_variable] = position_value
+            status_matches = skip_status or status_value in allowed_statuses
+            if position_value and status_matches:
+                return {
+                    "success": True,
+                    "phase": phase,
+                    "conditions": conditions,
+                    "values": values,
+                    "mismatches": {},
+                }
+            time.sleep(self.poll_interval)
+
+    @not_action
     def _slot_number(self, position: str | int) -> int:
         if isinstance(position, int):
             return position
@@ -234,6 +412,8 @@ class SzlabMixerRobotDevice(
 
     @not_action
     def _should_skip_robot_precheck_variable(self, variable_name: str) -> bool:
+        if variable_name in _NON_SKIPPABLE_ROBOT_SENSOR_VARIABLES:
+            return False
         raw_variables = os.environ.get("SKIP_ROBOT_PRECHECK_VARIABLES", "")
         skipped_variables = {
             item.strip()
@@ -343,6 +523,8 @@ class SzlabMixerRobotDevice(
         names = [name for name in written_variables if name != ROBOT_WRITE_DONE_VARIABLE]
         readback: dict[str, Any] = {name: None for name in names}
         while True:
+            if self._plc_alarm_active():
+                raise RuntimeError("PLC 报警已中止机器人任务参数写入确认")
             zero_variables = {}
             for name in names:
                 value = self._read_variable(name, use_cache=False)
@@ -368,6 +550,7 @@ class SzlabMixerRobotDevice(
         reset_variables = reset_variables or {ROBOT_TASK_NUMBER_VARIABLE: 0}
         try:
             pre_sensor_conditions, post_sensor_conditions = self._robot_sensor_requirements(task, station, data)
+            pre_gripper_requirement, post_gripper_requirement = self._gripper_requirements(task, station, data)
         except Exception as exc:
             result = {
                 "success": False,
@@ -415,6 +598,32 @@ class SzlabMixerRobotDevice(
             if precheck_result is not None:
                 self._last_task = {**precheck_result, "status": "rejected"}
                 return precheck_result
+
+        gripper_precheck = None
+        if pre_gripper_requirement is not None:
+            try:
+                gripper_precheck = self._wait_gripper_requirement(pre_gripper_requirement, phase="pre")
+            except Exception as exc:
+                gripper_precheck = {
+                    "success": False,
+                    "phase": "pre",
+                    "message": str(exc),
+                    "values": {},
+                }
+            if not gripper_precheck["success"]:
+                result = {
+                    "success": False,
+                    "message": gripper_precheck.get("message") or f"{station} {task} 夹爪前置检查失败",
+                    "task": task,
+                    "station": station,
+                    "task_number": int(task_number),
+                    "status": "rejected",
+                    "sensor_precheck": sensor_precheck,
+                    "gripper_precheck": gripper_precheck,
+                    **data,
+                }
+                self._last_task = result
+                return result
 
         try:
             handshake_precheck = self._run_robot_handshake_precheck(station)
@@ -502,6 +711,7 @@ class SzlabMixerRobotDevice(
             "completion_message": complete_message,
             "handshake_precheck": handshake_precheck,
             "sensor_precheck": sensor_precheck,
+            "gripper_precheck": gripper_precheck,
             "reset": reset_result,
             **data,
         }
@@ -517,6 +727,25 @@ class SzlabMixerRobotDevice(
                 "message": "机器人任务已完成，但 PC->PLC 变量复位失败",
                 **self._last_task,
             }
+
+        if post_gripper_requirement is not None:
+            try:
+                gripper_postcheck = self._wait_gripper_requirement(post_gripper_requirement, phase="post")
+            except Exception as exc:
+                gripper_postcheck = {
+                    "success": False,
+                    "phase": "post",
+                    "message": str(exc),
+                    "values": {},
+                }
+            self._last_task["gripper_postcheck"] = gripper_postcheck
+            if not gripper_postcheck["success"]:
+                self._last_task["status"] = "verification_failed"
+                return {
+                    "success": False,
+                    "message": gripper_postcheck.get("message") or "机器人任务已完成，但夹爪后置检查失败",
+                    **self._last_task,
+                }
         sensor_postcheck = None
         if post_sensor_conditions:
             try:
@@ -721,7 +950,7 @@ class SzlabMixerRobotDevice(
                 label="S09取放料产品",
                 data_key="product_type",
                 data_source=DataSource.HANDLE,
-                description="S09取放料产品：1=TIP盒，2=液体试剂瓶，3=烧杯",
+                description="S09取放料产品：1=TIP盒，2=液体试剂瓶，3=烧杯，4=测密度烧杯",
             ),
             ActionInputHandle(
                 key="position",
@@ -749,7 +978,7 @@ class SzlabMixerRobotDevice(
                 label="S09取放料产品",
                 data_key="product_type",
                 data_source=DataSource.HANDLE,
-                description="S09取放料产品：1=TIP盒，2=液体试剂瓶，3=烧杯",
+                description="S09取放料产品：1=TIP盒，2=液体试剂瓶，3=烧杯，4=测密度烧杯",
             ),
             ActionInputHandle(
                 key="position",

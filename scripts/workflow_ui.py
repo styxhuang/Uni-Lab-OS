@@ -6,8 +6,10 @@ import argparse
 import asyncio
 import csv
 import errno
+import hashlib
 import io
 import json
+import logging
 import os
 import re
 import tempfile
@@ -54,10 +56,18 @@ from scripts.opc_simulator_process_manager import (
     UnsafeSimulatorUrlConfirmationRequired,
 )
 from scripts.task_action_log_store import TaskActionLogStore
+from scripts.task_action_result import ActionReturnedFailure, find_action_failure
+from unilabos.devices.workstation.szlab_poly_studio.error_codes import (
+    enrich_mixing_failure,
+    enrich_with_plc_alarm,
+    plc_alarm_for_address,
+    read_active_plc_alarms,
+)
 from scripts.run_history_store import RunHistoryStore
 from scripts.task_execution_coordinator import (
     TaskApiConflict,
     TaskExecutionCoordinator,
+    validate_task_dispatch_preflight,
     workflow_nodes_from_payload,
 )
 from scripts.szlab_task_opc_simulator import DEFAULT_URL as DEFAULT_OPC_SIMULATOR_URL
@@ -89,9 +99,12 @@ from scripts.run_workflow_local import (
     ignore_opcua_token_time_drift,
     iter_action_logs,
     iter_opc_wait_logs,
+    log_opc_snapshot_failures,
+    log_opc_snapshot_recovery,
     load_workflow_nodes,
     load_runtime_config,
     node_method,
+    opc_snapshot_failures,
     route_node_device,
     run_nodes,
     snapshot_opc_state,
@@ -111,6 +124,7 @@ OPC_SIMULATOR_PROFILE_SPEC_PATH = (
     REPO_ROOT / "docs" / "developer_guide" / "opc_simulator_profile_v2.md"
 )
 GENERATED_GRAPH_SENTINEL = "__generated__"
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -326,8 +340,8 @@ _PARAM_HELP_BY_NAME: dict[str, dict[str, Any]] = {
     },
     "skip_level_check": {"label": "跳过液位检查", "description": "仅调试使用；开启后不执行前置液位检查。"},
     "beaker_true_means_present": {"label": "烧杯信号极性", "description": "开启表示传感器 True 代表烧杯在位。"},
-    "coarse_position": {"label": "粗注粉粉罐位", "description": "参与粗注粉的 S07 粉罐位置，范围 1–10。"},
-    "fine_position": {"label": "精注粉粉罐位", "description": "参与精注粉的 S07 粉罐位置，范围 1–10。"},
+    "coarse_position": {"label": "粗注粉粉罐位", "description": "参与粗注粉的 S07 粉罐位置，范围 1–10；选择 0 时跳过粗注粉。"},
+    "fine_position": {"label": "精注粉粉罐位", "description": "参与精注粉的 S07 粉罐位置，范围 1–10；选择 0 时跳过精注粉。"},
     "target_weight": {"label": "目标注粉重量", "description": "S07 本次注粉的目标重量。", "unit": "g（待 PLC 确认）"},
     "params_json": {"label": "配方文件", "description": "粗/精注粉参数 JSON 路径；留空使用设备默认文件。"},
     "recipe_name": {"label": "加粉策略", "description": "从默认注粉参数 JSON 中选择的策略名称，例如 default、salt 或 salt2。"},
@@ -388,7 +402,7 @@ _PARAM_HELP_BY_NAME: dict[str, dict[str, Any]] = {
         ],
     },
     "liquid_steps": {"label": "移液步骤", "description": "S09 批量移液步骤数组；每项包含取 TIP、吸液和放液参数。"},
-    "liquid_count": {"label": "液体种类数", "description": "最终测密度前需要依次加入的液体数量。"},
+    "liquid_count": {"label": "液体种类数", "description": "本次加液动作需要依次加入的液体数量。"},
     "liquid_additions": {"label": "各液体参数", "description": "每种液体的工位、溶剂标识和独立加液体积。"},
     "initialize_tip_inventory": {"label": "执行前初始化 TIP 库存", "description": "会覆盖当前 TIP 使用和绑定记录；仅在确认盒1状态后启用。"},
     "initial_used_tip_count": {"label": "初始化时已使用 TIP 数量", "description": "初始化后从 TIP 1 开始标记为不可用的数量。"},
@@ -402,7 +416,7 @@ _METHOD_PARAM_HELP: dict[tuple[str, str], dict[str, Any]] = {
         "label": "加液体积",
         "description": "S09 从所选加液体工位吸取并排入烧杯的体积；实际单位由“体积单位”决定。",
     },
-    ("add_liquid_with_reusable_tip", "density_measurement_count"): {
+    ("measure_density", "density_measurement_count"): {
         "label": "测密度次数",
         "description": "PLC 连续测密度次数，范围 1-10；每次结果写入对应的抽液/放液天平读数数组。",
     },
@@ -437,11 +451,12 @@ _METHOD_PARAM_HELP: dict[tuple[str, str], dict[str, Any]] = {
     **{
         (method, "product_type"): {
             "label": "S09 产品类型",
-            "description": "1=TIP盒，2=液体试剂瓶，3=烧杯。",
+            "description": "1=TIP盒，2=液体试剂瓶，3=烧杯，4=测密度烧杯。",
             "options": [
                 {"value": 1, "label": "TIP 盒"},
                 {"value": 2, "label": "液体试剂瓶"},
                 {"value": 3, "label": "烧杯"},
+                {"value": 4, "label": "测密度烧杯"},
             ],
         }
         for method in ("submit_place_to_s09", "submit_pick_from_s09")
@@ -487,8 +502,8 @@ _METHOD_PARAM_HELP: dict[tuple[str, str], dict[str, Any]] = {
     ("submit_pick_from_s02", "position"): {"description": "S02 TIP 盒取料位，范围 1–6。"},
     ("submit_place_to_s03", "position"): {"description": "S03 空容器仓位，范围 1–18；前端使用“行-列”格式，例如 1-1。"},
     ("submit_pick_from_s03", "position"): {"description": "S03 空容器仓位，范围 1–18；前端使用“行-列”格式，例如 1-1。"},
-    ("submit_place_to_s04", "position"): {"description": "S04 磁搅工位编号，范围 1–6。"},
-    ("submit_pick_from_s04", "position"): {"description": "S04 磁搅工位编号，范围 1–6。"},
+    ("submit_place_to_s04", "position"): {"description": "S04 磁搅工位编号，范围 1–4。"},
+    ("submit_pick_from_s04", "position"): {"description": "S04 磁搅工位编号，范围 1–4。"},
     ("submit_place_to_s071", "position"): {
         "description": "S071 粉罐仓位，PLC 编号范围 1–6；前端使用“行-列”格式，填 auto 时自动选择空位。"
     },
@@ -808,6 +823,69 @@ def _infer_log_category(
     return "workflow"
 
 
+def _task_execution_log_contract(
+    message: str,
+    *,
+    level: str,
+    detail: dict[str, Any] | None,
+    category: str = "",
+    code: str = "",
+    phase: str = "",
+) -> dict[str, str]:
+    """把现有 Workflow 日志兼容转换为统一的 Task 执行日志协议。"""
+    inferred = _infer_log_category(message, scope="node", detail=detail)
+    inferred_category = {
+        "opc": "opc",
+        "opc_sample": "opc",
+        "opc_change": "opc",
+        "opc_wait": "opc",
+        "action_result": "result",
+    }.get(inferred, "action")
+    normalized_level = str(level or "info").strip().lower()
+    legacy_error = not category and re.search(
+        r"失败|错误|error|failed", message, flags=re.IGNORECASE
+    )
+    if legacy_error and normalized_level not in {"error", "critical"}:
+        normalized_level = "error"
+    detail_type = detail.get("type") if isinstance(detail, dict) else None
+    has_result = isinstance(detail, dict) and "result" in detail
+    result_failure = find_action_failure(detail["result"]) if has_result else None
+    opc_wait_failure = False
+    if isinstance(detail, dict):
+        opc_wait_failure = (
+            detail_type == "opc_wait"
+            and detail.get("phase") == "finish"
+            and detail.get("success") is False
+        )
+    if result_failure is not None and not category:
+        inferred_category = "result"
+        normalized_level = "error"
+    if opc_wait_failure and not category:
+        inferred_category = "opc"
+        normalized_level = "error"
+    if result_failure is not None:
+        inferred_code = "action_returned_failure"
+    elif opc_wait_failure:
+        inferred_code = (
+            "opc_wait_read_failed" if detail.get("error") else "opc_wait_failed"
+        )
+    elif isinstance(detail_type, str) and detail_type.strip():
+        inferred_code = str(detail_type)
+    else:
+        inferred_code = {
+            "action_result": "action_result",
+            "error": "action_log_error",
+            "node": "action_log",
+        }.get(inferred, inferred)
+    detail_phase = detail.get("phase") if isinstance(detail, dict) else None
+    return {
+        "category": str(category or inferred_category).strip().lower(),
+        "level": normalized_level,
+        "code": str(code or inferred_code).strip(),
+        "phase": str(phase or detail_phase or "executing").strip(),
+    }
+
+
 def _run_node_with_live_opc_sampling(
     node: WorkflowNode,
     devices: dict[str, Any],
@@ -872,18 +950,53 @@ def _run_node_with_live_opc_sampling(
             f"OPC状态采样: {len(before)} 个变量",
             detail={"before": format_snapshot_detail(before, snapshot_client)},
         )
+    active_snapshot_failures = log_opc_snapshot_failures(
+        logger,
+        before,
+        snapshot_variables,
+        phase="sampling_before",
+        plc=snapshot_client,
+    )
 
     stop_sampling = threading.Event()
     last_snapshot = dict(before)
-    sampling_errors: list[Exception] = []
+    active_live_failure_signature = tuple(
+        (str(item.get("name") or ""), str(item.get("error") or ""))
+        for item in active_snapshot_failures
+    )
     skip_parallel_sampling = (
         bool(runtime_config.device_factory.devices) and snapshot_client is device
     )
 
     def sample_live_changes() -> None:
-        nonlocal last_snapshot
+        nonlocal active_live_failure_signature, active_snapshot_failures, last_snapshot
         while not stop_sampling.wait(sample_interval):
             current = snapshot_opc_state(snapshot_client, snapshot_variables)
+            failures = opc_snapshot_failures(
+                current,
+                snapshot_variables,
+                plc=snapshot_client,
+            )
+            failure_signature = tuple(
+                (str(item.get("name") or ""), str(item.get("error") or ""))
+                for item in failures
+            )
+            if failure_signature and failure_signature != active_live_failure_signature:
+                log_opc_snapshot_failures(
+                    logger,
+                    current,
+                    snapshot_variables,
+                    phase="sampling_live",
+                    plc=snapshot_client,
+                )
+            elif active_snapshot_failures and not failure_signature:
+                log_opc_snapshot_recovery(
+                    logger,
+                    active_snapshot_failures,
+                    phase="sampling_live",
+                )
+            active_snapshot_failures = failures
+            active_live_failure_signature = failure_signature
             diff_detail = build_snapshot_diff_detail(
                 last_snapshot, current, plc=snapshot_client
             )
@@ -908,6 +1021,9 @@ def _run_node_with_live_opc_sampling(
     unbind_wait_logger = bind_opc_wait_logger(
         logger, default_plc, device, snapshot_client
     )
+    clear_wait_alarm = getattr(default_plc, "clear_last_wait_alarm", None)
+    if callable(clear_wait_alarm):
+        clear_wait_alarm()
     try:
         result = action_callable(**node.param)
     finally:
@@ -935,26 +1051,82 @@ def _run_node_with_live_opc_sampling(
             f"OPC状态变化: {len(diff_detail['changes'])}/{len(before)} 个变量变化",
             detail=diff_detail,
         )
-    if sampling_errors:
-        logger.log(f"OPC实时采样异常: {sampling_errors[-1]}", level="warning")
+    after_failures = log_opc_snapshot_failures(
+        logger,
+        after,
+        snapshot_variables,
+        phase="sampling_after",
+        plc=snapshot_client,
+    )
+    if active_snapshot_failures and not after_failures:
+        log_opc_snapshot_recovery(
+            logger,
+            active_snapshot_failures,
+            phase="sampling_after",
+        )
     for action_log in iter_action_logs(result):
         logger.log(
             action_log["message"],
             detail={"action_log": action_log.get("detail")},
         )
     for wait_log in iter_opc_wait_logs(default_plc, device, snapshot_client):
-        logger.log(wait_log["message"], detail=wait_log.get("detail"))
+        logger.log(
+            wait_log["message"],
+            level=wait_log.get("level", "info"),
+            detail=wait_log.get("detail"),
+        )
+    failure = find_action_failure(result)
+    reported_failure = failure
+    if failure is not None:
+        enriched_failure = enrich_mixing_failure(
+            failure,
+            device_id=device_name,
+        )
+        get_wait_alarm = getattr(default_plc, "get_last_wait_alarm", None)
+        wait_alarm_data = get_wait_alarm(clear=True) if callable(get_wait_alarm) else None
+        wait_alarm = (
+            plc_alarm_for_address(str(wait_alarm_data.get("plc_address") or ""))
+            if isinstance(wait_alarm_data, dict)
+            else None
+        )
+        active_alarms = [] if wait_alarm is not None else read_active_plc_alarms(
+            default_plc,
+            stations=(
+                {str(enriched_failure["station"])}
+                if enriched_failure and enriched_failure.get("station")
+                else None
+            ),
+        )
+        if wait_alarm is not None:
+            reported_failure = enrich_with_plc_alarm(
+                enriched_failure or failure,
+                alarm=wait_alarm,
+            )
+        elif active_alarms:
+            reported_failure = enrich_with_plc_alarm(
+                enriched_failure or failure,
+                alarm=active_alarms[0],
+            )
+        elif enriched_failure is not None:
+            reported_failure = enriched_failure
+        if result is failure:
+            result = reported_failure
     if isinstance(result, dict):
-        status_text = "成功" if result.get("success") is not False else "失败"
+        status_text = "成功" if failure is None else "失败"
         summary = f"动作结果：{status_text}"
         display_message = result.get("display_message")
         if display_message:
             logger.log(str(display_message))
         elif result.get("message"):
             summary = f"{summary} · {result['message']}"
+    elif failure is not None:
+        summary = f"动作结果：失败 · {result}"
     else:
         summary = f"动作结果：{result}"
-    logger.log(summary, detail={"result": result})
+    result_detail = {"result": result}
+    if reported_failure is not None and result is not reported_failure:
+        result_detail["reported_failure"] = reported_failure
+    logger.log(summary, detail=result_detail)
 
     output = {
         "uuid": node.uuid,
@@ -965,9 +1137,29 @@ def _run_node_with_live_opc_sampling(
         "opc_after": after,
         "result": result,
     }
-    if isinstance(result, dict) and result.get("success") is False:
-        raise RuntimeError(f"动作失败: {device_name}.{method_name}: {result}")
+    if reported_failure is not None:
+        raise ActionReturnedFailure(
+            device_id=device_name,
+            action_name=method_name,
+            failure=reported_failure,
+        )
     return [output]
+
+
+def _task_workflow_fingerprint(payload: dict[str, Any]) -> str:
+    """为预检使用的 workflow 快照生成稳定指纹。"""
+    workflow = payload.get("data", payload)
+    try:
+        canonical = json.dumps(
+            workflow,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("workflow 内容无法生成稳定指纹") from exc
+    return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
 
 
 class WorkflowRunManager:
@@ -994,6 +1186,10 @@ class WorkflowRunManager:
         self._sensor_event_plc: Any = None
         self._task_snapshot_publisher = TaskOrchestrationSnapshotPublisher()
         self._task_action_log_store = TaskActionLogStore()
+        self._active_scheduler_errors: dict[
+            str, dict[tuple[str, str, str, str, str], dict[str, Any]]
+        ] = {}
+        self._active_opc_errors: dict[tuple[str, str], dict[str, Any]] = {}
         self._run_history_store = run_history_store or RunHistoryStore()
         self._task_execution_coordinator = TaskExecutionCoordinator(
             task_client=self._task_snapshot_publisher,
@@ -1008,7 +1204,19 @@ class WorkflowRunManager:
         *,
         level: str = "info",
         detail: dict[str, Any] | None = None,
+        category: str = "",
+        code: str = "",
+        phase: str = "",
+        record_incident: bool = True,
     ) -> None:
+        contract = _task_execution_log_contract(
+            message,
+            level=level,
+            detail=detail,
+            category=category,
+            code=code,
+            phase=phase,
+        )
         try:
             self._task_action_log_store.append(
                 workflow_path=str(context.get("workflow_path") or ""),
@@ -1016,7 +1224,13 @@ class WorkflowRunManager:
                 node_id=str(context.get("node_id") or ""),
                 execution_id=str(context.get("execution_id") or ""),
                 sample_id=str(context.get("sample_id") or ""),
-                level=level,
+                template_id=str(context.get("template_id") or ""),
+                device_id=str(context.get("device_id") or ""),
+                action_name=str(context.get("action_name") or ""),
+                category=contract["category"],
+                level=contract["level"],
+                code=contract["code"],
+                phase=contract["phase"],
                 message=message,
                 detail=detail,
             )
@@ -1030,21 +1244,31 @@ class WorkflowRunManager:
                 node_id=str(context.get("node_id") or ""),
                 execution_id=str(context.get("execution_id") or ""),
                 sample_id=str(context.get("sample_id") or ""),
-                level=level,
+                level=contract["level"],
                 message=message,
                 detail=detail,
             )
         except Exception:
             # 持久化失败不得影响 Action 执行
-            pass
-        normalized_level = str(level).lower()
-        if normalized_level in {"warning", "error", "critical"} or any(
-            keyword in message for keyword in ("报警", "告警")
+            _LOGGER.exception("Task Action 日志持久化失败")
+        normalized_level = contract["level"]
+        if record_incident and (
+            normalized_level in {"warning", "error", "critical"} or any(
+                keyword in message for keyword in ("报警", "告警")
+            )
         ):
             try:
+                error_category = {
+                    "schedule": "scheduler_error",
+                    "opc": "opc_error",
+                }.get(contract["category"], "action_error")
                 self._run_history_store.record_incident(
-                    category="action_alarm",
-                    code="action_log_alarm",
+                    category=(
+                        error_category
+                        if normalized_level in {"error", "critical"}
+                        else "action_alarm"
+                    ),
+                    code=contract["code"] or "action_log_alarm",
                     severity=(
                         normalized_level
                         if normalized_level in {"warning", "error", "critical"}
@@ -1056,7 +1280,9 @@ class WorkflowRunManager:
                     sample_id=str(context.get("sample_id") or ""),
                     node_id=str(context.get("node_id") or ""),
                     execution_id=str(context.get("execution_id") or ""),
-                    phase="动作执行中",
+                    device_id=str(context.get("device_id") or ""),
+                    action_name=str(context.get("action_name") or ""),
+                    phase=contract["phase"] or "动作执行中",
                     detail=detail,
                 )
             except Exception:
@@ -1083,7 +1309,7 @@ class WorkflowRunManager:
             )
         except Exception:
             # 台账不得改变原有动作执行路径
-            pass
+            _LOGGER.exception("Task Action 开始记录持久化失败")
 
         def writer(message: str, *, level: str = "info", detail: dict[str, Any] | None = None) -> None:
             self._append_task_action_log(
@@ -1103,6 +1329,27 @@ class WorkflowRunManager:
                 runtime_config=self._runtime_config,
             )
         except Exception as exc:
+            returned_failure = isinstance(exc, ActionReturnedFailure)
+            traceback_text = traceback.format_exc()
+            if not returned_failure:
+                exception_type = type(exc).__name__
+                exception_text = str(exc).strip()
+                self._append_task_action_log(
+                    context,
+                    f"Action 执行失败：{exception_type}"
+                    + (f"：{exception_text}" if exception_text else ""),
+                    level="error",
+                    category="action",
+                    code="action_exception",
+                    phase="executing",
+                    detail={
+                        "type": "action_exception",
+                        "exception_type": exception_type,
+                        "message": exception_text,
+                        "traceback": traceback_text,
+                    },
+                    record_incident=False,
+                )
             try:
                 self._run_history_store.record_action_finish(
                     execution_id=execution_id,
@@ -1110,23 +1357,27 @@ class WorkflowRunManager:
                     error={
                         "type": type(exc).__name__,
                         "message": str(exc),
-                        "traceback": traceback.format_exc(),
-                    },
-                )
-                self._run_history_store.record_incident(
-                    category="action_error",
-                    code="action_failed",
-                    severity="error",
-                    message=str(exc),
-                    execution_id=execution_id,
-                    phase="动作执行中",
-                    detail={
-                        "type": type(exc).__name__,
-                        "traceback": traceback.format_exc(),
+                        "traceback": traceback_text,
                     },
                 )
             except Exception:
                 pass
+            if not returned_failure:
+                try:
+                    self._run_history_store.record_incident(
+                        category="action_error",
+                        code="action_failed",
+                        severity="error",
+                        message=str(exc),
+                        execution_id=execution_id,
+                        phase="动作执行中",
+                        detail={
+                            "type": type(exc).__name__,
+                            "traceback": traceback_text,
+                        },
+                    )
+                except Exception:
+                    pass
             raise
         try:
             self._run_history_store.record_action_finish(
@@ -1137,6 +1388,184 @@ class WorkflowRunManager:
         except Exception:
             pass
         return result
+
+    def _publish_task_scheduler_errors(
+        self,
+        *,
+        workflow_path: str,
+        diagnostics: Any,
+    ) -> None:
+        """把新出现的调度错误发布到统一日志，并抑制连续 tick 重复。"""
+        items = diagnostics if isinstance(diagnostics, list) else []
+        current_items: dict[
+            tuple[str, str, str, str, str], dict[str, Any]
+        ] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            level = str(item.get("severity") or "warning").strip().lower()
+            if level not in {"error", "critical"}:
+                continue
+            key = (
+                str(item.get("instance_id") or ""),
+                str(item.get("node_id") or ""),
+                str(item.get("execution_id") or ""),
+                str(item.get("code") or "scheduler_error"),
+                str(item.get("message") or ""),
+            )
+            current_items.setdefault(key, item)
+
+        with self._lock:
+            previous_items = self._active_scheduler_errors.get(
+                workflow_path, {}
+            )
+            new_keys = current_items.keys() - previous_items.keys()
+            recovered_keys = previous_items.keys() - current_items.keys()
+            if current_items:
+                self._active_scheduler_errors[workflow_path] = current_items
+            else:
+                self._active_scheduler_errors.pop(workflow_path, None)
+
+        for key in recovered_keys:
+            item = previous_items[key]
+            original_code = str(item.get("code") or "scheduler_error")
+            original_message = str(item.get("message") or original_code)
+            self._append_task_action_log(
+                {
+                    "workflow_path": workflow_path,
+                    "instance_id": str(item.get("instance_id") or ""),
+                    "sample_id": str(item.get("sample_id") or ""),
+                    "template_id": str(item.get("template_id") or ""),
+                    "node_id": str(item.get("node_id") or ""),
+                    "execution_id": str(item.get("execution_id") or ""),
+                    "device_id": str(item.get("device_id") or ""),
+                    "action_name": str(item.get("action_name") or ""),
+                },
+                f"调度错误已恢复：{original_message}",
+                level="info",
+                category="schedule",
+                code="scheduler_error_recovered",
+                phase="recovered",
+                detail={
+                    "type": "scheduler_error_recovered",
+                    "original_code": original_code,
+                    "original_message": original_message,
+                    "original_phase": str(item.get("phase") or "dispatching"),
+                    "diagnostic_category": str(item.get("category") or ""),
+                },
+                record_incident=False,
+            )
+
+        for key, item in current_items.items():
+            if key not in new_keys:
+                continue
+            code = str(item.get("code") or "scheduler_error")
+            message = str(item.get("message") or code)
+            self._append_task_action_log(
+                {
+                    "workflow_path": workflow_path,
+                    "instance_id": str(item.get("instance_id") or ""),
+                    "sample_id": str(item.get("sample_id") or ""),
+                    "template_id": str(item.get("template_id") or ""),
+                    "node_id": str(item.get("node_id") or ""),
+                    "execution_id": str(item.get("execution_id") or ""),
+                    "device_id": str(item.get("device_id") or ""),
+                    "action_name": str(item.get("action_name") or ""),
+                },
+                message,
+                level=str(item.get("severity") or "error"),
+                category="schedule",
+                code=code,
+                phase=str(item.get("phase") or "dispatching"),
+                detail={
+                    "type": "scheduler_diagnostic",
+                    "diagnostic_category": str(item.get("category") or ""),
+                    "immediate": bool(item.get("immediate")),
+                    "diagnostic": (
+                        item.get("detail")
+                        if isinstance(item.get("detail"), dict)
+                        else {}
+                    ),
+                },
+                record_incident=False,
+            )
+
+    def _update_task_opc_error(
+        self,
+        *,
+        workflow_path: str,
+        operation: str,
+        code: str = "",
+        message: str = "",
+        phase: str = "polling",
+        device_id: str = "",
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """发布 OPC 错误状态，并在连续失败结束时补一条恢复日志。"""
+        state_key = (workflow_path, operation)
+        error_key = (str(code or ""), str(message or ""))
+        with self._lock:
+            previous = self._active_opc_errors.get(state_key)
+            if not code:
+                self._active_opc_errors.pop(state_key, None)
+            elif previous and previous.get("error_key") == error_key:
+                return
+            else:
+                self._active_opc_errors[state_key] = {
+                    "error_key": error_key,
+                    "code": code,
+                    "message": message or code,
+                    "phase": phase,
+                    "device_id": device_id,
+                    "detail": dict(detail or {}),
+                }
+        if not code:
+            if previous is None:
+                return
+            operation_label = {
+                "connect": "连接",
+                "registration": "注册与初始采样",
+                "poll": "轮询采样",
+            }.get(operation, operation)
+            original_code = str(previous.get("code") or "opc_error")
+            original_message = str(previous.get("message") or original_code)
+            self._append_task_action_log(
+                {
+                    "workflow_path": workflow_path,
+                    "device_id": str(previous.get("device_id") or device_id),
+                },
+                f"OPC {operation_label}已恢复：{original_message}",
+                level="info",
+                category="opc",
+                code="opc_error_recovered",
+                phase="recovered",
+                detail={
+                    "type": "opc_error_recovered",
+                    "operation": operation,
+                    "original_code": original_code,
+                    "original_message": original_message,
+                    "original_phase": str(previous.get("phase") or phase),
+                    "original_detail": previous.get("detail") or {},
+                },
+                record_incident=False,
+            )
+            return
+        self._append_task_action_log(
+            {
+                "workflow_path": workflow_path,
+                "device_id": device_id,
+            },
+            message or code,
+            level="error",
+            category="opc",
+            code=code,
+            phase=phase,
+            detail={
+                "type": code,
+                "operation": operation,
+                **(detail or {}),
+            },
+        )
 
     def list_task_action_logs(
         self,
@@ -1149,6 +1578,18 @@ class WorkflowRunManager:
             workflow_path,
             after_seq=after_seq,
             instance_id=instance_id,
+        )
+
+    def append_task_execution_timings(
+        self,
+        *,
+        workflow_path: str,
+        entries: list[dict[str, Any]],
+    ) -> int:
+        """持久化前端排程循环的分段耗时。"""
+        return self._run_history_store.append_scheduler_timings(
+            workflow_path=workflow_path,
+            entries=entries,
         )
 
     def list_run_history(self, *, limit: int = 50) -> dict[str, Any]:
@@ -1259,6 +1700,64 @@ class WorkflowRunManager:
         with self._lock:
             return dict(self._cached_devices)
 
+    def preflight_task_dispatch(
+        self,
+        *,
+        workflow_path: str,
+        expected_version: int,
+        workflow_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """使用当前工作区和 workflow 快照检查 Task 是否允许派发。"""
+        if type(expected_version) is not int or expected_version < 0:
+            raise ValueError("expected_version 必须是非负整数")
+        result, _ = self._evaluate_task_dispatch_preflight(
+            workflow_path=workflow_path,
+            workflow_payload=workflow_payload,
+            expected_version=expected_version,
+        )
+        return result
+
+    def _evaluate_task_dispatch_preflight(
+        self,
+        *,
+        workflow_path: str,
+        workflow_payload: dict[str, Any],
+        expected_version: int | None = None,
+    ) -> tuple[dict[str, Any], list[WorkflowNode]]:
+        """基于服务端最新工作区执行预检，并返回本次解析的节点快照。"""
+        workflow_nodes = workflow_nodes_from_payload(workflow_payload)
+        workflow_fingerprint = _task_workflow_fingerprint(workflow_payload)
+        response = self._task_snapshot_publisher.get_workspace(
+            workflow_path=workflow_path
+        )
+        actual_version = response.get("version")
+        if type(actual_version) is not int:
+            raise RuntimeError("Task 排程服务未返回有效工作区版本")
+        if expected_version is not None and actual_version != expected_version:
+            raise TaskApiConflict(
+                "version_conflict",
+                (
+                    "Task 工作区版本已变化: "
+                    f"expected={expected_version}, actual={actual_version}"
+                ),
+            )
+        workspace = response.get("workspace")
+        if not isinstance(workspace, dict):
+            raise RuntimeError("Task 排程服务未返回有效工作区")
+        result = validate_task_dispatch_preflight(
+            workspace,
+            workflow_nodes,
+            self._task_execution_devices(),
+        )
+        return (
+            {
+                **result.as_dict(),
+                "workspace_version": actual_version,
+                "workflow_fingerprint": workflow_fingerprint,
+            },
+            workflow_nodes,
+        )
+
     def run_task_execution_cycle(
         self,
         *,
@@ -1271,11 +1770,75 @@ class WorkflowRunManager:
             raise TypeError("harvest_only 必须为 bool")
         if not harvest_only and not isinstance(workflow_payload, dict):
             raise ValueError("缺少当前 workflow JSON")
-        workflow_nodes = (
-            []
-            if harvest_only
-            else workflow_nodes_from_payload(workflow_payload)
-        )
+        preflight_result: dict[str, Any] | None = None
+        if harvest_only:
+            workflow_nodes: list[WorkflowNode] = []
+        else:
+            preflight_result, workflow_nodes = (
+                self._evaluate_task_dispatch_preflight(
+                    workflow_path=workflow_path,
+                    workflow_payload=workflow_payload,
+                )
+            )
+            if not preflight_result.get("valid"):
+                # 已在途动作仍需正常收割终态，但预检失败后绝不认领新动作。
+                stats = self._task_execution_coordinator.cycle(
+                    workflow_path=workflow_path,
+                    workflow_nodes=workflow_nodes,
+                    harvest_only=True,
+                )
+                errors = preflight_result.get("errors")
+                issues = errors if isinstance(errors, list) else []
+                diagnostics: list[dict[str, Any]] = []
+                for issue in issues:
+                    if not isinstance(issue, dict):
+                        continue
+                    diagnostic = dict(issue)
+                    instance_ids = issue.get("instance_ids")
+                    resolved_instance_ids = (
+                        [str(item) for item in instance_ids if str(item)]
+                        if isinstance(instance_ids, list)
+                        else []
+                    )
+                    if resolved_instance_ids:
+                        diagnostic["instance_id"] = resolved_instance_ids[0]
+                    diagnostic["immediate"] = True
+                    diagnostic["detail"] = {
+                        **(
+                            issue.get("detail")
+                            if isinstance(issue.get("detail"), dict)
+                            else {}
+                        ),
+                        "instance_ids": resolved_instance_ids,
+                    }
+                    diagnostics.append(diagnostic)
+                existing_diagnostics = stats.get("diagnostics")
+                stats["diagnostics"] = [
+                    *(
+                        existing_diagnostics
+                        if isinstance(existing_diagnostics, list)
+                        else []
+                    ),
+                    *diagnostics,
+                ]
+                first_message = next(
+                    (
+                        str(item.get("message") or "").strip()
+                        for item in issues
+                        if isinstance(item, dict)
+                        and str(item.get("message") or "").strip()
+                    ),
+                    "存在派发阻断项",
+                )
+                stats["success"] = False
+                stats["code"] = "task_dispatch_preflight_failed"
+                stats["message"] = f"派发预检未通过：{first_message}"
+                stats["preflight"] = preflight_result
+                self._publish_task_scheduler_errors(
+                    workflow_path=workflow_path,
+                    diagnostics=stats["diagnostics"],
+                )
+                return stats
         try:
             stats = self._task_execution_coordinator.cycle(
                 workflow_path=workflow_path,
@@ -1283,6 +1846,28 @@ class WorkflowRunManager:
                 harvest_only=harvest_only,
             )
         except Exception as exc:
+            traceback_text = traceback.format_exc()
+            self._publish_task_scheduler_errors(
+                workflow_path=workflow_path,
+                diagnostics=[
+                    {
+                        "category": "scheduler_error",
+                        "code": "execution_cycle_failed",
+                        "severity": "error",
+                        "immediate": True,
+                        "phase": "scheduling",
+                        "message": (
+                            f"调度循环失败：{type(exc).__name__}"
+                            + (f"：{exc}" if str(exc) else "")
+                        ),
+                        "detail": {
+                            "exception_type": type(exc).__name__,
+                            "message": str(exc),
+                            "traceback": traceback_text,
+                        },
+                    }
+                ],
+            )
             try:
                 self._run_history_store.record_incident(
                     category="scheduler_error",
@@ -1293,12 +1878,16 @@ class WorkflowRunManager:
                     phase="排程循环",
                     detail={
                         "type": type(exc).__name__,
-                        "traceback": traceback.format_exc(),
+                        "traceback": traceback_text,
                     },
                 )
             except Exception:
                 pass
             raise
+        self._publish_task_scheduler_errors(
+            workflow_path=workflow_path,
+            diagnostics=stats.get("diagnostics"),
+        )
         if not harvest_only:
             try:
                 self._run_history_store.observe_scheduler_cycle(
@@ -1402,7 +1991,6 @@ class WorkflowRunManager:
         workflow_path: str,
     ) -> dict[str, Any]:
         """通过既有 PLC 设备工厂连接 Task 页面请求的 OPC runtime。"""
-        del workflow_path
         normalized_url = opcua_url.strip()
         if not normalized_url:
             raise ValueError("请填写 OPC UA URL")
@@ -1431,17 +2019,42 @@ class WorkflowRunManager:
             str(csv_path or ""),
             no_subscription,
         )
-        return self._get_or_create_devices(
-            device_key,
-            {
-                "graph_file": graph_file,
-                "opcua_url": normalized_url,
-                "csv_path": csv_path,
-                "use_subscription": False if no_subscription else None,
-                "runtime_config": self._runtime_config,
-            },
-            lambda message: None,
+        try:
+            devices = self._get_or_create_devices(
+                device_key,
+                {
+                    "graph_file": graph_file,
+                    "opcua_url": normalized_url,
+                    "csv_path": csv_path,
+                    "use_subscription": False if no_subscription else None,
+                    "runtime_config": self._runtime_config,
+                },
+                lambda message: None,
+            )
+        except Exception as exc:
+            self._update_task_opc_error(
+                workflow_path=workflow_path,
+                operation="connect",
+                code="opc_connection_failed",
+                message=_task_opc_connect_error_message(
+                    exc, opcua_url=normalized_url
+                ),
+                phase="connecting",
+                device_id=(
+                    self._runtime_config.device_factory.plc_device_id
+                    or "szlab_poly_plc"
+                ),
+                detail={
+                    "exception_type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            raise
+        self._update_task_opc_error(
+            workflow_path=workflow_path,
+            operation="connect",
         )
+        return devices
 
     def _get_or_create_devices(
         self,
@@ -1571,18 +2184,52 @@ class WorkflowRunManager:
         plc_device_id = (
             self._runtime_config.device_factory.plc_device_id or "szlab_poly_plc"
         )
+
+        def finish(
+            result: dict[str, Any],
+            *,
+            code: str = "",
+            detail: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            self._update_task_opc_error(
+                workflow_path=workflow_path,
+                operation="registration",
+                code=code,
+                message=str(result.get("message") or code),
+                phase="registering",
+                device_id=plc_device_id,
+                detail=detail,
+            )
+            return result
+
         plc = devices.get(plc_device_id) or devices.get("szlab_poly_plc")
         registered = getattr(plc, "registered_variables", None)
         get_variables = getattr(plc, "get_variables", None)
         if not callable(registered):
-            return {
-                "distributed": False,
-                "message": "当前运行时未提供可分发的 PLC 注册变量",
-            }
-        variable_names = list(registered())
+            return finish(
+                {
+                    "distributed": False,
+                    "message": "当前运行时未提供可分发的 PLC 注册变量",
+                },
+                code="opc_registration_unsupported",
+            )
+        try:
+            variable_names = list(registered())
+        except Exception as exc:
+            return finish(
+                {"distributed": False, "message": str(exc)},
+                code="opc_registration_failed",
+                detail={
+                    "exception_type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
         variable_aliases = self._registered_plc_variable_aliases(plc)
         if not variable_names:
-            return {"distributed": False, "message": "PLC 尚未注册任何变量"}
+            return finish(
+                {"distributed": False, "message": "PLC 尚未注册任何变量"},
+                code="opc_registration_empty",
+            )
         try:
             registration = self._task_snapshot_publisher.register(
                 workflow_path=workflow_path,
@@ -1591,23 +2238,60 @@ class WorkflowRunManager:
                 registered_variables=variable_names,
                 variable_aliases=variable_aliases,
             )
-            if not read_snapshot:
-                return {"distributed": True, "variable_count": 0}
-            if not callable(get_variables):
-                return {
+        except Exception as exc:
+            message = str(exc).strip() or type(exc).__name__
+            return finish(
+                {"distributed": False, "message": message},
+                code="opc_registration_failed",
+                detail={
+                    "exception_type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+        if not read_snapshot:
+            return finish({"distributed": True, "variable_count": 0})
+        if not callable(get_variables):
+            return finish(
+                {
                     "distributed": False,
                     "message": "当前运行时未提供 PLC 变量读取接口",
-                }
-            condition_variables = self._template_condition_variables(
-                registration, plc_device_id, variable_names, variable_aliases
+                },
+                code="opc_sampling_unsupported",
             )
-            if not condition_variables:
-                return {"distributed": True, "variable_count": 0}
-            values = extract_registered_opc_values(
-                get_variables(condition_variables, use_cache=False)
+        condition_variables = self._template_condition_variables(
+            registration, plc_device_id, variable_names, variable_aliases
+        )
+        if not condition_variables:
+            return finish({"distributed": True, "variable_count": 0})
+        try:
+            snapshot = get_variables(condition_variables, use_cache=False)
+        except Exception as exc:
+            message = str(exc).strip() or type(exc).__name__
+            return finish(
+                {"distributed": False, "message": message},
+                code="opc_condition_snapshot_failed",
+                detail={
+                    "variables": condition_variables,
+                    "exception_type": type(exc).__name__,
+                    "message": str(exc),
+                },
             )
-            if not values:
-                return {"distributed": False, "message": "模板条件变量当前均无法读取"}
+        failures = opc_snapshot_failures(
+            snapshot,
+            condition_variables,
+            plc=plc,
+        )
+        values = extract_registered_opc_values(snapshot)
+        if not values:
+            return finish(
+                {
+                    "distributed": False,
+                    "message": "模板条件变量当前均无法读取",
+                },
+                code="opc_condition_snapshot_failed",
+                detail={"failures": failures},
+            )
+        try:
             self._task_snapshot_publisher.publish_snapshot(
                 workflow_path=workflow_path,
                 expected_version=int(registration["version"]),
@@ -1615,8 +2299,24 @@ class WorkflowRunManager:
                 values=values,
             )
         except Exception as exc:
-            return {"distributed": False, "message": str(exc)}
-        return {"distributed": True, "variable_count": len(values)}
+            message = str(exc).strip() or type(exc).__name__
+            return finish(
+                {"distributed": False, "message": message},
+                code="opc_snapshot_publish_failed",
+                detail={
+                    "exception_type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+        result = {"distributed": True, "variable_count": len(values)}
+        if failures:
+            result["message"] = "部分模板条件变量无法读取"
+            return finish(
+                result,
+                code="opc_condition_snapshot_partial",
+                detail={"failures": failures},
+            )
+        return finish(result)
 
     def poll_task_opc(self, *, workflow_path: str) -> dict[str, Any]:
         """按当前非终态 Task 的条件读取 PLC，并分发最小快照。"""
@@ -1625,31 +2325,79 @@ class WorkflowRunManager:
         plc_device_id = (
             self._runtime_config.device_factory.plc_device_id or "szlab_poly_plc"
         )
+
+        def finish(
+            result: dict[str, Any],
+            *,
+            code: str = "",
+            detail: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            self._update_task_opc_error(
+                workflow_path=workflow_path,
+                operation="poll",
+                code=code,
+                message=str(result.get("message") or code),
+                phase="polling",
+                device_id=plc_device_id,
+                detail=detail,
+            )
+            return result
+
         plc = devices.get(plc_device_id) or devices.get("szlab_poly_plc")
         if plc is None or not bool(getattr(plc, "client", None)):
-            return {"success": False, "active": False, "message": "Task OPC 尚未连接"}
+            return finish(
+                {
+                    "success": False,
+                    "active": False,
+                    "message": "Task OPC 尚未连接",
+                },
+                code="opc_not_connected",
+            )
         registered = getattr(plc, "registered_variables", None)
         get_variables = getattr(plc, "get_variables", None)
         if not callable(registered) or not callable(get_variables):
-            return {
-                "success": False,
-                "active": False,
-                "message": "当前 PLC 不支持按需变量采样",
-            }
-        variable_names = list(registered())
-        workspace_response = self._task_snapshot_publisher.get_workspace(
-            workflow_path=workflow_path
-        )
+            return finish(
+                {
+                    "success": False,
+                    "active": False,
+                    "message": "当前 PLC 不支持按需变量采样",
+                },
+                code="opc_sampling_unsupported",
+            )
+        try:
+            variable_names = list(registered())
+            workspace_response = self._task_snapshot_publisher.get_workspace(
+                workflow_path=workflow_path
+            )
+        except Exception as exc:
+            message = str(exc).strip() or type(exc).__name__
+            return finish(
+                {"success": False, "active": False, "message": message},
+                code="opc_poll_failed",
+                detail={
+                    "exception_type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
         workspace = workspace_response.get("workspace")
         if not isinstance(workspace, dict):
-            return {"success": False, "active": False, "message": "Task 工作区内容无效"}
+            return finish(
+                {
+                    "success": False,
+                    "active": False,
+                    "message": "Task 工作区内容无效",
+                },
+                code="opc_workspace_invalid",
+            )
         active = any(
             isinstance(instance, dict)
             and instance.get("status") not in {"completed", "failed", "cancelled"}
             for instance in workspace.get("task_instances", [])
         )
         if not active:
-            return {"success": True, "active": False, "variable_count": 0}
+            return finish(
+                {"success": True, "active": False, "variable_count": 0}
+            )
         condition_variables = self._active_task_condition_variables(
             workspace,
             plc_device_id,
@@ -1664,26 +2412,50 @@ class WorkflowRunManager:
             include_running_outputs=False,
         )
         if not condition_variables:
-            return {"success": True, "active": True, "variable_count": 0}
-        try:
-            values = extract_registered_opc_values(
-                get_variables(condition_variables, use_cache=False)
+            return finish(
+                {"success": True, "active": True, "variable_count": 0}
             )
+        try:
+            snapshot = get_variables(condition_variables, use_cache=False)
+            failures = opc_snapshot_failures(
+                snapshot,
+                condition_variables,
+                plc=plc,
+            )
+            values = extract_registered_opc_values(snapshot)
         except Exception as exc:
+            message = str(exc).strip() or type(exc).__name__
+            detail = {
+                "variables": condition_variables,
+                "exception_type": type(exc).__name__,
+                "message": str(exc),
+            }
             if input_variables:
-                return {"success": False, "active": True, "message": str(exc)}
-            return {
-                "success": True,
-                "active": True,
-                "variable_count": 0,
-                "message": f"Task 输出状态采样失败：{exc}",
-            }
+                return finish(
+                    {"success": False, "active": True, "message": message},
+                    code="opc_input_snapshot_failed",
+                    detail=detail,
+                )
+            return finish(
+                {
+                    "success": True,
+                    "active": True,
+                    "variable_count": 0,
+                    "message": f"Task 输出状态采样失败：{message}",
+                },
+                code="opc_output_snapshot_failed",
+                detail=detail,
+            )
         if any(variable not in values for variable in input_variables):
-            return {
-                "success": False,
-                "active": True,
-                "message": "当前 Task 条件变量均无法读取",
-            }
+            return finish(
+                {
+                    "success": False,
+                    "active": True,
+                    "message": "当前 Task 条件变量均无法读取",
+                },
+                code="opc_input_snapshot_failed",
+                detail={"failures": failures},
+            )
         output_variables = [
             variable
             for variable in condition_variables
@@ -1693,22 +2465,42 @@ class WorkflowRunManager:
             variable not in values for variable in output_variables
         )
         if not values:
-            return {
-                "success": True,
-                "active": True,
-                "variable_count": 0,
-                "message": "当前 Task 输出状态变量均无法读取",
-            }
-        self._task_snapshot_publisher.publish_snapshot(
-            workflow_path=workflow_path,
-            expected_version=int(workspace_response["version"]),
-            plc_device_id=plc_device_id,
-            values=values,
-        )
+            return finish(
+                {
+                    "success": True,
+                    "active": True,
+                    "variable_count": 0,
+                    "message": "当前 Task 输出状态变量均无法读取",
+                },
+                code="opc_output_snapshot_failed",
+                detail={"failures": failures},
+            )
+        try:
+            self._task_snapshot_publisher.publish_snapshot(
+                workflow_path=workflow_path,
+                expected_version=int(workspace_response["version"]),
+                plc_device_id=plc_device_id,
+                values=values,
+            )
+        except Exception as exc:
+            message = str(exc).strip() or type(exc).__name__
+            return finish(
+                {"success": False, "active": True, "message": message},
+                code="opc_snapshot_publish_failed",
+                detail={
+                    "exception_type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
         result = {"success": True, "active": True, "variable_count": len(values)}
         if missing_output:
             result["message"] = "部分 Task 输出状态变量无法读取"
-        return result
+            return finish(
+                result,
+                code="opc_output_snapshot_partial",
+                detail={"failures": failures},
+            )
+        return finish(result)
 
     @staticmethod
     def _template_condition_variables(
@@ -1920,6 +2712,28 @@ class WorkflowRunManager:
                 record.node_statuses[node.uuid] = "running"
                 method_name = node_method(node)
                 device_name = route_node_device(node, self._runtime_config)
+                execution_id = f"workflow:{run_id}:{node_index}:{node.uuid}"
+                history_context = {
+                    "workflow_path": task_workspace_path,
+                    "instance_id": run_id,
+                    "sample_id": str(payload.get("sample_id") or ""),
+                    "node_id": node.uuid,
+                    "execution_id": execution_id,
+                }
+                try:
+                    self._run_history_store.record_action_start(
+                        workflow_path=history_context["workflow_path"],
+                        instance_id=history_context["instance_id"],
+                        sample_id=history_context["sample_id"],
+                        node_id=history_context["node_id"],
+                        execution_id=history_context["execution_id"],
+                        device_id=device_name,
+                        action_name=method_name,
+                        params=node.param,
+                    )
+                except Exception:
+                    # 持久化失败不得影响普通 Workflow 的设备动作。
+                    _LOGGER.exception("Workflow 节点开始记录持久化失败")
                 if timing_recorder is not None:
                     timing_recorder.start_step(
                         index=node_index,
@@ -1945,6 +2759,16 @@ class WorkflowRunManager:
                     record.append_log(message, node_id=node_id, level=level, detail=detail)
                     if timing_recorder is not None:
                         timing_recorder.observe_log(message, detail)
+                    try:
+                        self._run_history_store.append_event(
+                            **history_context,
+                            level=level,
+                            message=message,
+                            detail=detail,
+                        )
+                    except Exception:
+                        # 持久化失败不得中断节点日志或设备动作。
+                        _LOGGER.exception("Workflow 节点日志持久化失败")
 
                 logger = WorkflowLogger(writer=append_node_log)
                 device = devices.get(device_name)
@@ -1992,6 +2816,30 @@ class WorkflowRunManager:
                 except Exception as exc:
                     if timing_recorder is not None:
                         timing_recorder.finish_step(error=str(exc))
+                    try:
+                        error_detail = {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                            "traceback": traceback.format_exc(),
+                        }
+                        self._run_history_store.record_action_finish(
+                            execution_id=execution_id,
+                            status="failed",
+                            error=error_detail,
+                        )
+                        self._run_history_store.record_incident(
+                            category="action_error",
+                            code="workflow_action_failed",
+                            severity="error",
+                            message=str(exc),
+                            **history_context,
+                            device_id=device_name,
+                            action_name=method_name,
+                            phase="普通 Workflow 执行",
+                            detail=error_detail,
+                        )
+                    except Exception:
+                        pass
                     record.node_statuses[node.uuid] = "failed"
                     record.append_log(
                         f"节点执行失败: {exc}", node_id=node.uuid, level="error"
@@ -2004,6 +2852,14 @@ class WorkflowRunManager:
                             record.clear_live_status(node.uuid, "s07_balance")
                 if timing_recorder is not None:
                     timing_recorder.finish_step(result=node_results)
+                try:
+                    self._run_history_store.record_action_finish(
+                        execution_id=execution_id,
+                        status="completed",
+                        result=node_results,
+                    )
+                except Exception:
+                    pass
                 record.node_statuses[node.uuid] = "success"
                 record.append_log(f"节点执行完成 {node.uuid}", node_id=node.uuid)
                 if record.cancel_requested:
@@ -2745,9 +3601,24 @@ def create_app(
                 "task_orchestration": distribution,
             }
         except Exception as exc:
+            error_message = _task_opc_connect_error_message(
+                exc, opcua_url=opcua_url
+            )
+            manager._update_task_opc_error(
+                workflow_path=workspace_path,
+                operation="connect",
+                code="opc_connection_failed",
+                message=error_message,
+                phase="connecting",
+                device_id=plc_device_id,
+                detail={
+                    "exception_type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
             return {
                 "success": False,
-                "message": _task_opc_connect_error_message(exc, opcua_url=opcua_url),
+                "message": error_message,
                 "plc": {
                     "device_id": plc_device_id,
                     "connected": False,
@@ -2767,7 +3638,87 @@ def create_app(
         try:
             return manager.poll_task_opc(workflow_path=workspace_path)
         except Exception as exc:
-            return {"success": False, "active": False, "message": str(exc)}
+            error_message = str(exc).strip() or type(exc).__name__
+            manager._update_task_opc_error(
+                workflow_path=workspace_path,
+                operation="poll",
+                code="opc_poll_failed",
+                message=error_message,
+                phase="polling",
+                device_id=(
+                    runtime_config.device_factory.plc_device_id
+                    or "szlab_poly_plc"
+                ),
+                detail={
+                    "exception_type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            return {
+                "success": False,
+                "active": False,
+                "message": error_message,
+            }
+
+    @app.post("/api/task-execution/preflight", response_class=JSONResponse)
+    async def preflight_task_dispatch(
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        workspace_path = str(payload.get("task_workspace_path") or "").strip()
+        workflow_payload = payload.get("workflow")
+        expected_version = payload.get("expected_version")
+        if not workspace_path:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "preflight_request_invalid",
+                    "message": "缺少当前 workflow 路径",
+                },
+            )
+        if type(expected_version) is not int or expected_version < 0:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "preflight_request_invalid",
+                    "message": "expected_version 必须是非负整数",
+                },
+            )
+        if not isinstance(workflow_payload, dict):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "preflight_request_invalid",
+                    "message": "缺少当前 workflow JSON",
+                },
+            )
+        try:
+            result = await asyncio.to_thread(
+                manager.preflight_task_dispatch,
+                workflow_path=workspace_path,
+                expected_version=expected_version,
+                workflow_payload=workflow_payload,
+            )
+        except TaskApiConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "workflow_invalid", "message": str(exc)},
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "preflight_failed",
+                    "message": str(exc).strip() or type(exc).__name__,
+                },
+            ) from exc
+        if not result.get("valid"):
+            raise HTTPException(status_code=422, detail=result)
+        return result
 
     @app.post("/api/task-execution/tick", response_class=JSONResponse)
     async def run_task_execution_tick(
@@ -2824,6 +3775,30 @@ def create_app(
                 "failed": 0,
             }
 
+    @app.post("/api/task-execution/timings", response_class=JSONResponse)
+    async def append_task_execution_timings(
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        workflow_path = str(payload.get("task_workspace_path") or "").strip()
+        entries = payload.get("entries")
+        if not workflow_path:
+            return {"success": False, "message": "缺少当前 workflow 路径", "written": 0}
+        if not isinstance(entries, list) or not entries or len(entries) > 200:
+            return {
+                "success": False,
+                "message": "entries 必须是包含 1-200 项的数组",
+                "written": 0,
+            }
+        try:
+            written = await asyncio.to_thread(
+                manager.append_task_execution_timings,
+                workflow_path=workflow_path,
+                entries=entries,
+            )
+            return {"success": True, "written": written}
+        except Exception as exc:
+            return {"success": False, "message": str(exc), "written": 0}
+
     @app.get("/api/task-execution/logs", response_class=JSONResponse)
     async def get_task_execution_logs(
         task_workspace_path: str = "",
@@ -2836,6 +3811,8 @@ def create_app(
                 "success": False,
                 "message": "缺少当前 workflow 路径",
                 "latest_seq": 0,
+                "next_after_seq": max(0, int(after_seq)),
+                "has_more": False,
                 "entries": [],
             }
         try:
@@ -2850,6 +3827,8 @@ def create_app(
                 "success": False,
                 "message": str(exc),
                 "latest_seq": 0,
+                "next_after_seq": max(0, int(after_seq)),
+                "has_more": False,
                 "entries": [],
             }
 
@@ -3301,6 +4280,10 @@ def start_ui(
 ) -> None:
     import uvicorn
 
+    run_history_store = RunHistoryStore()
+    history_paths = run_history_store.initialize()
+    print(f"运行历史数据库已初始化: {history_paths['database_path']}")
+
     url = f"http://{host if host != '0.0.0.0' else 'localhost'}:{port}/"
     if open_browser:
         webbrowser.open(url)
@@ -3309,6 +4292,7 @@ def start_ui(
             preset_name=preset_name,
             runtime_config=runtime_config,
             timing_enabled=timing_enabled,
+            run_history_store=run_history_store,
         ),
         host=host,
         port=port,

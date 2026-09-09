@@ -1,3 +1,7 @@
+export type TaskExecutionLogCategory = 'schedule' | 'action' | 'opc' | 'result';
+
+export type TaskExecutionLogLevel = 'debug' | 'info' | 'warning' | 'error' | 'critical';
+
 export type TaskActionLogEntry = {
   seq: number;
   timestamp: number;
@@ -5,7 +9,13 @@ export type TaskActionLogEntry = {
   node_id: string;
   execution_id: string;
   sample_id: string;
+  template_id?: string;
+  device_id?: string;
+  action_name?: string;
+  category?: TaskExecutionLogCategory;
   level: string;
+  code?: string;
+  phase?: string;
   message: string;
   detail: Record<string, unknown>;
 };
@@ -28,10 +38,44 @@ export type TaskProcessLogLine = {
   message: string;
 };
 
+type StructuredActionError = {
+  code?: unknown;
+  error_code?: unknown;
+  error_title?: unknown;
+  message?: unknown;
+  plc_address?: unknown;
+  recovery?: unknown;
+  station?: unknown;
+};
+
 function formatValue(value: unknown): string {
   if (value === null || value === undefined) return '—';
   if (typeof value === 'object') return JSON.stringify(value);
   return String(value);
+}
+
+function structuredActionError(detail: Record<string, unknown>): StructuredActionError | null {
+  const candidates = [detail.reported_failure, detail.result];
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue;
+    const value = candidate as StructuredActionError;
+    if (value.error_code || value.code || value.error_title || value.recovery || value.plc_address) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function structuredErrorMessage(error: StructuredActionError): string {
+  const code = error.error_code || error.code;
+  const fields = [
+    code ? `报错码：${String(code)}` : '',
+    error.station ? `工站：${String(error.station)}` : '',
+    error.plc_address ? `PLC 地址：${String(error.plc_address)}` : '',
+    error.error_title ? `错误：${String(error.error_title)}` : '',
+    error.recovery ? `处理建议：${String(error.recovery)}` : '',
+  ].filter(Boolean);
+  return fields.join(' · ');
 }
 
 function opcWaitPhaseLabel(phase: string | undefined): string {
@@ -148,18 +192,31 @@ export function buildTaskVariableRows(entries: TaskActionLogEntry[]): TaskVariab
 }
 
 export function buildTaskProcessLogLines(entries: TaskActionLogEntry[]): TaskProcessLogLine[] {
-  return entries
-    .filter((entry) => {
+  return entries.flatMap((entry) => {
       const detail = entry.detail || {};
-      return detail.type !== 'opc_wait';
-    })
-    .map((entry) => ({
+      if (detail.type === 'opc_wait') return [];
+      const lines: TaskProcessLogLine[] = [{
       seq: entry.seq,
       timestamp: entry.timestamp,
       nodeId: entry.node_id,
       level: entry.level,
       message: entry.message,
-    }));
+      }];
+      const structured = structuredActionError(detail);
+      if (structured) {
+        const message = structuredErrorMessage(structured);
+        if (message) {
+          lines.push({
+            seq: entry.seq,
+            timestamp: entry.timestamp,
+            nodeId: entry.node_id,
+            level: 'error',
+            message,
+          });
+        }
+      }
+      return lines;
+    });
 }
 
 export function mergeTaskActionLogs(
@@ -171,8 +228,7 @@ export function mergeTaskActionLogs(
     bySeq.set(entry.seq, entry);
   }
   return Array.from(bySeq.values())
-    .sort((left, right) => left.seq - right.seq)
-    .slice(-2000);
+    .sort((left, right) => left.seq - right.seq);
 }
 
 export function groupTaskActionLogsByNode(
@@ -205,10 +261,16 @@ export async function fetchTaskActionLogs(
   fetcher: typeof fetch,
   workflowPath: string,
   options: { afterSeq?: number; instanceId?: string } = {},
-): Promise<{ latest_seq: number; entries: TaskActionLogEntry[] }> {
+): Promise<{
+  latest_seq: number;
+  next_after_seq: number;
+  has_more: boolean;
+  entries: TaskActionLogEntry[];
+}> {
+  const requestedAfterSeq = options.afterSeq ?? 0;
   const params = new URLSearchParams({
     task_workspace_path: workflowPath,
-    after_seq: String(options.afterSeq ?? 0),
+    after_seq: String(requestedAfterSeq),
   });
   if (options.instanceId) {
     params.set('instance_id', options.instanceId);
@@ -217,14 +279,51 @@ export async function fetchTaskActionLogs(
   const payload = await response.json() as {
     success?: boolean;
     latest_seq?: number;
+    next_after_seq?: number;
+    has_more?: boolean;
     entries?: TaskActionLogEntry[];
     message?: string;
   };
   if (!response.ok || !payload.success) {
     throw new Error(payload.message || 'Task 日志不可用');
   }
+  const entries = Array.isArray(payload.entries) ? payload.entries : [];
+  const lastEntrySeq = entries.length ? Number(entries[entries.length - 1].seq) : requestedAfterSeq;
+  const nextAfterSeq = Number(payload.next_after_seq ?? lastEntrySeq);
+  const hasMore = payload.has_more === true;
+  if (hasMore && nextAfterSeq <= requestedAfterSeq) {
+    throw new Error('Task 日志分页游标未推进');
+  }
   return {
     latest_seq: Number(payload.latest_seq || 0),
-    entries: Array.isArray(payload.entries) ? payload.entries : [],
+    next_after_seq: nextAfterSeq,
+    has_more: hasMore,
+    entries,
   };
+}
+
+export async function fetchAllTaskActionLogs(
+  fetcher: typeof fetch,
+  workflowPath: string,
+  options: { afterSeq?: number; instanceId?: string } = {},
+): Promise<{
+  latest_seq: number;
+  next_after_seq: number;
+  entries: TaskActionLogEntry[];
+}> {
+  let afterSeq = options.afterSeq ?? 0;
+  let latestSeq = afterSeq;
+  const entries: TaskActionLogEntry[] = [];
+  while (true) {
+    const page = await fetchTaskActionLogs(fetcher, workflowPath, {
+      ...options,
+      afterSeq,
+    });
+    latestSeq = Math.max(latestSeq, page.latest_seq);
+    entries.push(...page.entries);
+    afterSeq = page.next_after_seq;
+    if (!page.has_more) {
+      return { latest_seq: latestSeq, next_after_seq: afterSeq, entries };
+    }
+  }
 }

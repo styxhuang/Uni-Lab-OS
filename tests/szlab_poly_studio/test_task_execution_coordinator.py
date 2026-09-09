@@ -17,11 +17,16 @@ from scripts.run_workflow_local import (
 )
 from scripts.task_execution_coordinator import (
     TaskApiConflict,
+    TaskDispatchPreflightCode,
     TaskExecutionCoordinator,
     _atomic_start_signal_conditions,
     _atomic_task_start_trigger_satisfied,
+    _find_free_s04_position,
     _resolve_sample_s04_position,
+    _temporary_s08_trigger_satisfied,
+    _temporary_s09_trigger_satisfied,
     deterministic_execution_id,
+    validate_task_dispatch_preflight,
     workflow_nodes_from_payload,
 )
 from scripts.workflow_ui import ActionSpec, DEFAULT_PRESET, build_graph_workflow
@@ -103,8 +108,8 @@ ATOMIC_START_NODES = [
         method="add_liquid_with_reusable_tip",
         param={
             "liquid_station_index": 1,
+            "solvent_batch_id": "solvent-batch-001",
             "volume": 5000,
-            "density_volume": 5000,
             "volume_unit": "raw",
             "S09液体瓶1剩余液量": 10.0,
         },
@@ -127,6 +132,14 @@ ATOMIC_START_NODES = [
         legacy_route_compatible=False,
     ),
     WorkflowNode(
+        uuid="w06_pick_beaker_s04",
+        name="S04 取烧杯",
+        device_name="szlab_mixer_robot",
+        method="submit_pick_from_s04",
+        param={"position": 1},
+        legacy_route_compatible=False,
+    ),
+    WorkflowNode(
         uuid="w05_pick_sample_vial_s03",
         name="S03 取样品瓶",
         device_name="szlab_mixer_robot",
@@ -137,7 +150,7 @@ ATOMIC_START_NODES = [
 ]
 
 
-def test_sample_vial_start_requires_vial_present_and_matching_beaker_slot_empty():
+def test_sample_vial_start_requires_source_vial_and_empty_s08_target():
     node = next(
         item for item in ATOMIC_START_NODES
         if item.uuid == "w05_pick_sample_vial_s03"
@@ -148,7 +161,233 @@ def test_sample_vial_start_requires_vial_present_and_matching_beaker_slot_empty(
     assert conditions == {
         "传感器状态_上位机[1].NO[8]": True,
         "传感器状态_上位机[0].NO[6]": False,
+        "传感器状态_上位机[3].NO[14]": False,
     }
+
+
+def test_sample_vial_start_waits_when_s08_target_is_physically_occupied():
+    node = next(
+        item for item in ATOMIC_START_NODES
+        if item.uuid == "w05_pick_sample_vial_s03"
+    )
+    conditions = _atomic_start_signal_conditions(node)
+    conditions["传感器状态_上位机[3].NO[14]"] = True
+
+    assert not _atomic_task_start_trigger_satisfied(
+        {"task_instances": []},
+        node=node,
+        devices={"szlab_poly_plc": FakeTriggerPlc(conditions)},
+    )
+
+
+def test_s08_inbound_reservation_blocks_another_sample_before_place():
+    workspace = {
+        "templates": [
+            {
+                "id": "inbound",
+                "node_ids": [
+                    "w05_pick_sample_vial_s03",
+                    "w05_place_sample_vial_s08",
+                ],
+            }
+        ],
+        "task_instances": [
+            {
+                "id": "sample-a-inbound",
+                "sample_id": "sample-a",
+                "template_id": "inbound",
+                "execution_state": {
+                    "records": [
+                        {
+                            "node_id": "w05_pick_sample_vial_s03",
+                            "status": "succeeded",
+                            "finished_at": 10,
+                        }
+                    ]
+                },
+            }
+        ],
+    }
+
+    assert not _temporary_s08_trigger_satisfied(
+        workspace,
+        instance_id="sample-b-inbound",
+        sample_id="sample-b",
+        node_id="w05_pick_sample_vial_s03",
+    )
+    assert _temporary_s08_trigger_satisfied(
+        workspace,
+        instance_id="sample-a-inbound",
+        sample_id="sample-a",
+        node_id="w05_place_sample_vial_s08",
+    )
+
+
+def test_s08_occupied_station_only_allows_owner_until_pick_succeeds():
+    workspace = {
+        "templates": [
+            {
+                "id": "inbound",
+                "node_ids": [
+                    "w05_pick_sample_vial_s03",
+                    "w05_place_sample_vial_s08",
+                ],
+            },
+            {
+                "id": "outbound",
+                "node_ids": ["w07_pick_sample_vial_s08"],
+            },
+        ],
+        "task_instances": [
+            {
+                "id": "sample-a-inbound",
+                "sample_id": "sample-a",
+                "template_id": "inbound",
+                "execution_state": {
+                    "records": [
+                        {
+                            "node_id": "w05_pick_sample_vial_s03",
+                            "status": "succeeded",
+                            "finished_at": 10,
+                        },
+                        {
+                            "node_id": "w05_place_sample_vial_s08",
+                            "status": "succeeded",
+                            "finished_at": 20,
+                        },
+                    ]
+                },
+            }
+        ],
+    }
+
+    assert _temporary_s08_trigger_satisfied(
+        workspace,
+        instance_id="sample-a-open",
+        sample_id="sample-a",
+        node_id="w05_open_sample_vial_s08",
+    )
+    assert not _temporary_s08_trigger_satisfied(
+        workspace,
+        instance_id="sample-b-open",
+        sample_id="sample-b",
+        node_id="w05_open_sample_vial_s08",
+    )
+    assert _temporary_s08_trigger_satisfied(
+        workspace,
+        instance_id="sample-a-pour",
+        sample_id="sample-a",
+        node_id="w06_pick_beaker_s09_after_density",
+    )
+    assert not _temporary_s08_trigger_satisfied(
+        workspace,
+        instance_id="sample-b-pour",
+        sample_id="sample-b",
+        node_id="w06_pick_beaker_s09_after_density",
+    )
+    assert not _temporary_s08_trigger_satisfied(
+        workspace,
+        instance_id="sample-b-inbound",
+        sample_id="sample-b",
+        node_id="w05_pick_sample_vial_s03",
+    )
+
+    workspace["task_instances"].append(
+        {
+            "id": "sample-a-outbound",
+            "sample_id": "sample-a",
+            "template_id": "outbound",
+            "execution_state": {
+                "records": [
+                    {
+                        "node_id": "w07_pick_sample_vial_s08",
+                        "status": "succeeded",
+                        "finished_at": 30,
+                    }
+                ]
+            },
+        }
+    )
+
+    assert _temporary_s08_trigger_satisfied(
+        workspace,
+        instance_id="sample-b-inbound",
+        sample_id="sample-b",
+        node_id="w05_pick_sample_vial_s03",
+    )
+
+
+def test_s09_density_return_reserves_empty_beaker_station_until_place():
+    node_ids = [
+        "w03_pick_beaker_s06",
+        "w03_place_beaker_s09",
+        "w03_add_liquid_s09",
+        "w04_pick_beaker_s09",
+        "w06_pick_beaker_s05_for_density",
+        "w05_place_beaker_s09_for_density",
+        "w05_measure_density_s09",
+        "w06_pick_beaker_s09_after_density",
+    ]
+    workspace = {
+        "templates": [{"id": "main", "node_ids": node_ids}],
+        "task_instances": [{
+            "id": "sample-a",
+            "sample_id": "sample-a",
+            "template_id": "main",
+            "execution_state": {"records": [
+                {"node_id": "w03_pick_beaker_s06", "status": "succeeded", "finished_at": 10},
+                {"node_id": "w03_place_beaker_s09", "status": "succeeded", "finished_at": 20},
+                {"node_id": "w04_pick_beaker_s09", "status": "succeeded", "finished_at": 30},
+                {
+                    "node_id": "w06_pick_beaker_s05_for_density",
+                    "status": "succeeded",
+                    "finished_at": 40,
+                },
+            ]},
+        }],
+    }
+
+    assert not _temporary_s09_trigger_satisfied(
+        workspace,
+        instance_id="sample-b",
+        node_id="w03_pick_beaker_s06",
+    )
+    assert _temporary_s09_trigger_satisfied(
+        workspace,
+        instance_id="sample-a",
+        node_id="w05_place_beaker_s09_for_density",
+    )
+
+    workspace["task_instances"][0]["execution_state"]["records"].append(
+        {
+            "node_id": "w05_place_beaker_s09_for_density",
+            "status": "succeeded",
+            "finished_at": 50,
+        }
+    )
+    assert _temporary_s09_trigger_satisfied(
+        workspace,
+        instance_id="sample-a",
+        node_id="w05_measure_density_s09",
+    )
+    assert not _temporary_s09_trigger_satisfied(
+        workspace,
+        instance_id="sample-b",
+        node_id="w03_pick_beaker_s06",
+    )
+
+    workspace["task_instances"][0]["execution_state"]["records"].append(
+        {
+            "node_id": "w06_pick_beaker_s09_after_density",
+            "status": "succeeded",
+            "finished_at": 60,
+        }
+    )
+    assert _temporary_s09_trigger_satisfied(
+        workspace,
+        instance_id="sample-b",
+        node_id="w03_pick_beaker_s06",
+    )
 
 
 def test_same_sample_s04_process_and_pick_inherit_latest_place_position():
@@ -198,17 +437,108 @@ def test_same_sample_s04_process_and_pick_inherit_latest_place_position():
     ) == 4
 
 
+def test_same_sample_s04_position_prefers_runtime_selected_place_result():
+    nodes = {
+        "w04_place_beaker_s04": WorkflowNode(
+            uuid="w04_place_beaker_s04",
+            name="S04 放烧杯",
+            device_name="szlab_mixer_robot",
+            method="submit_place_to_s04",
+            param={"position": 2},
+        ),
+    }
+    templates = {
+        "place": {"id": "place", "node_ids": ["w04_place_beaker_s04"]},
+        "stir": {"id": "stir", "node_ids": ["w04_run_stirring_s04"]},
+    }
+    workspace = {
+        "task_instances": [{
+            "id": "sample-a-place",
+            "sample_id": "sample-a",
+            "template_id": "place",
+            "order": 6,
+            "execution_state": {
+                "records": [{
+                    "node_id": "w04_place_beaker_s04",
+                    "status": "succeeded",
+                    "result": {"success": True, "position": 1},
+                }],
+            },
+        }],
+    }
+
+    assert _resolve_sample_s04_position(
+        workspace,
+        instance={"sample_id": "sample-a", "order": 7},
+        templates=templates,
+        nodes_by_id=nodes,
+    ) == 1
+
+
+def test_same_sample_s04_position_reads_wrapped_runtime_place_result():
+    nodes = {
+        "w04_place_beaker_s04": WorkflowNode(
+            uuid="w04_place_beaker_s04",
+            name="S04 放烧杯",
+            device_name="szlab_mixer_robot",
+            method="submit_place_to_s04",
+            param={"position": 1},
+        ),
+    }
+    templates = {
+        "place": {"id": "place", "node_ids": ["w04_place_beaker_s04"]},
+        "stir": {"id": "stir", "node_ids": ["w04_run_stirring_s04"]},
+    }
+    workspace = {
+        "task_instances": [{
+            "id": "sample-a-place",
+            "sample_id": "sample-a",
+            "template_id": "place",
+            "order": 6,
+            "execution_state": {
+                "records": [{
+                    "node_id": "w04_place_beaker_s04",
+                    "status": "succeeded",
+                    "result": [{
+                        "uuid": "w04_place_beaker_s04",
+                        "param": {"position": 2},
+                        "result": {"success": True, "position": 2},
+                    }],
+                }],
+            },
+        }],
+    }
+
+    assert _resolve_sample_s04_position(
+        workspace,
+        instance={"sample_id": "sample-a", "order": 7},
+        templates=templates,
+        nodes_by_id=nodes,
+    ) == 2
+
+
 @pytest.mark.parametrize("node", ATOMIC_START_NODES, ids=lambda node: node.uuid)
-def test_first_eight_atomic_tasks_require_all_start_signals(node):
+def test_atomic_tasks_require_all_start_signals(node):
     conditions = _atomic_start_signal_conditions(node)
-    plc = FakeTriggerPlc(conditions)
+    plc_values = dict(conditions)
+    expected_reads = set(conditions)
+    if node.uuid == "w03_pick_beaker_s06":
+        plc_values.update({
+            "传感器状态_上位机[2].NO[10]": False,
+            "S041准备信号": True,
+        })
+        expected_reads.update({
+            "传感器状态_上位机[2].NO[10]",
+            "S041准备信号",
+        })
+    plc = FakeTriggerPlc(plc_values)
 
     assert _atomic_task_start_trigger_satisfied(
         {"task_instances": []},
         node=node,
         devices={"szlab_poly_plc": plc},
     )
-    assert set(plc.reads) == set(conditions)
+    assert set(plc.reads) == expected_reads
 
     first_name = next(iter(conditions))
     blocked_values = dict(conditions)
@@ -217,6 +547,26 @@ def test_first_eight_atomic_tasks_require_all_start_signals(node):
         {"task_instances": []},
         node=node,
         devices={"szlab_poly_plc": FakeTriggerPlc(blocked_values)},
+    )
+
+
+def test_s04_to_s05_waits_while_s05_is_occupied():
+    node = next(
+        item for item in ATOMIC_START_NODES
+        if item.uuid == "w06_pick_beaker_s04"
+    )
+    conditions = _atomic_start_signal_conditions(node)
+
+    assert conditions == {
+        "传感器状态_上位机[2].NO[10]": True,
+        "传感器状态_上位机[3].NO[0]": False,
+        "S05准备信号": True,
+    }
+    conditions["传感器状态_上位机[3].NO[0]"] = True
+    assert not _atomic_task_start_trigger_satisfied(
+        {"task_instances": []},
+        node=node,
+        devices={"szlab_poly_plc": FakeTriggerPlc(conditions)},
     )
 
 
@@ -302,13 +652,27 @@ def test_s09_to_s04_start_uses_next_place_node_target_position():
     }
 
 
+def test_find_free_s04_position_continues_after_one_position_read_error():
+    plc = FakeTriggerPlc({
+        "传感器状态_上位机[2].NO[11]": False,
+        "S042准备信号": True,
+    })
+
+    assert _find_free_s04_position({"szlab_poly_plc": plc}) == 2
+    assert plc.reads == [
+        "传感器状态_上位机[2].NO[10]",
+        "传感器状态_上位机[2].NO[11]",
+        "S042准备信号",
+    ]
+
+
 @pytest.mark.parametrize(
     ("node_id", "active_node_id"),
     [
         ("w01_pick_beaker_s03", "w01_dose_powder_s07"),
         ("w02_pick_beaker_s072", "w02_add_solvent_s06"),
         ("w03_pick_beaker_s06", "w03_add_liquid_s09"),
-        ("w04_pick_beaker_s09", "w04_run_stirring_s04"),
+        ("w04_pick_beaker_s09", "w03_add_liquid_s09"),
     ],
 )
 def test_atomic_transport_waits_while_target_station_process_is_active(
@@ -331,6 +695,67 @@ def test_atomic_transport_waits_while_target_station_process_is_active(
         workspace,
         node=node,
         devices={"szlab_poly_plc": FakeTriggerPlc(conditions)},
+    )
+
+
+def test_s06_to_s09_waits_until_at_least_one_s04_position_is_available():
+    node = next(
+        item for item in ATOMIC_START_NODES
+        if item.uuid == "w03_pick_beaker_s06"
+    )
+    values = _atomic_start_signal_conditions(node)
+    for position in range(1, 5):
+        values[f"传感器状态_上位机[2].NO[{position + 9}]"] = True
+        values[f"S04{position}准备信号"] = True
+
+    assert not _atomic_task_start_trigger_satisfied(
+        {"task_instances": []},
+        node=node,
+        devices={"szlab_poly_plc": FakeTriggerPlc(values)},
+    )
+
+    values["传感器状态_上位机[2].NO[12]"] = False
+    assert _atomic_task_start_trigger_satisfied(
+        {"task_instances": []},
+        node=node,
+        devices={"szlab_poly_plc": FakeTriggerPlc(values)},
+    )
+
+
+def test_s09_to_s04_transport_can_start_while_another_s04_position_is_stirring():
+    node = next(
+        item
+        for item in ATOMIC_START_NODES
+        if item.uuid == "w04_pick_beaker_s09"
+    )
+    next_node = WorkflowNode(
+        uuid="w04_place_beaker_s04",
+        name="S04 放烧杯",
+        device_name="szlab_mixer_robot",
+        method="submit_place_to_s04",
+        param={"position": 2, "sample_id": "sample-002"},
+        legacy_route_compatible=False,
+    )
+    workspace = {
+        "task_instances": [
+            {
+                "execution_state": {
+                    "active_execution_id": "execution-active",
+                    "active_node_id": "w04_run_stirring_s04",
+                }
+            }
+        ]
+    }
+    plc = FakeTriggerPlc({
+        "传感器状态_上位机[2].NO[11]": False,
+        "S042准备信号": True,
+    })
+
+    assert _atomic_task_start_trigger_satisfied(
+        workspace,
+        node=node,
+        next_node=next_node,
+        devices={"szlab_poly_plc": plc},
     )
 
 
@@ -448,6 +873,153 @@ def test_execution_id_is_deterministic_and_cursor_sensitive():
     assert first != deterministic_execution_id("instance-2", 2, "node-3")
 
 
+def test_dispatch_preflight_error_codes_are_stable():
+    assert {item.value for item in TaskDispatchPreflightCode} == {
+        "task_dispatch_scope_empty",
+        "workspace_recovery_required",
+        "task_template_missing",
+        "task_template_empty",
+        "task_node_missing",
+        "task_node_not_executable",
+        "task_node_invalid",
+        "task_device_missing",
+        "task_action_unsupported",
+    }
+
+
+def test_dispatch_preflight_accepts_matching_active_task():
+    workspace = _workspace_response()["workspace"]
+
+    result = validate_task_dispatch_preflight(
+        workspace,
+        [_node("node_001_pick_from_s03", "submit_pick_from_s03")],
+        _devices(),
+    )
+
+    assert result.valid is True
+    assert result.as_dict() == {
+        "valid": True,
+        "errors": [],
+        "warnings": [],
+    }
+
+
+def test_dispatch_preflight_reports_task_node_missing_before_dispatch():
+    workspace = _workspace_response(node_ids=["task-action"])["workspace"]
+    workspace["templates"][0]["name"] = "样品处理"
+
+    result = validate_task_dispatch_preflight(
+        workspace,
+        [_node("standalone-action", "run")],
+        _devices(),
+    )
+
+    assert result.valid is False
+    assert [item.code for item in result.errors] == [
+        TaskDispatchPreflightCode.NODE_MISSING
+    ]
+    assert result.errors[0].template_id == "template-1"
+    assert result.errors[0].template_name == "样品处理"
+    assert result.errors[0].node_id == "task-action"
+    assert result.errors[0].instance_ids == ("instance-1",)
+    assert result.errors[0].as_dict()["category"] == "dispatch_preflight"
+    assert result.errors[0].as_dict()["phase"] == "preflight"
+
+
+def test_dispatch_preflight_checks_scheduled_template_without_active_instance():
+    workspace = _workspace_response()["workspace"]
+    workspace["scheduled_template_ids"] = ["template-1"]
+    workspace["task_instances"] = []
+
+    result = validate_task_dispatch_preflight(
+        workspace,
+        [_node("node_001_pick_from_s03", "submit_pick_from_s03")],
+        _devices(),
+    )
+
+    assert result.valid is True
+
+
+def test_dispatch_preflight_ignores_inactive_historical_template():
+    workspace = _workspace_response()["workspace"]
+    workspace["templates"].append({
+        "id": "historical-template",
+        "name": "历史模板",
+        "node_ids": ["deleted-node"],
+    })
+
+    result = validate_task_dispatch_preflight(
+        workspace,
+        [_node("node_001_pick_from_s03", "submit_pick_from_s03")],
+        _devices(),
+    )
+
+    assert result.valid is True
+
+
+@pytest.mark.parametrize(
+    ("node", "devices", "expected_code"),
+    [
+        (
+            replace(_node("node_001_pick_from_s03", "run"), disabled=True),
+            {"device": FakeActionDevice()},
+            TaskDispatchPreflightCode.NODE_NOT_EXECUTABLE,
+        ),
+        (
+            WorkflowNode(
+                uuid="node_001_pick_from_s03",
+                name="invalid",
+                device_name="device",
+                param={},
+                legacy_route_compatible=False,
+            ),
+            {"device": FakeActionDevice()},
+            TaskDispatchPreflightCode.NODE_INVALID,
+        ),
+        (
+            _node("node_001_pick_from_s03", "run", "missing-device"),
+            {},
+            TaskDispatchPreflightCode.DEVICE_MISSING,
+        ),
+        (
+            _node("node_001_pick_from_s03", "run"),
+            {"device": object()},
+            TaskDispatchPreflightCode.ACTION_UNSUPPORTED,
+        ),
+    ],
+)
+def test_dispatch_preflight_separates_action_readiness_errors(
+    node, devices, expected_code
+):
+    result = validate_task_dispatch_preflight(
+        _workspace_response()["workspace"],
+        [node],
+        devices,
+    )
+
+    assert [item.code for item in result.errors] == [expected_code]
+
+
+def test_dispatch_preflight_rejects_empty_scope_and_failed_pause():
+    workspace = _workspace_response()["workspace"]
+    workspace["task_instances"] = [{
+        "id": "completed-instance",
+        "template_id": "template-1",
+        "status": "completed",
+    }]
+    workspace["pause_reason"] = {
+        "code": "action_failed",
+        "message": "首动作失败",
+    }
+
+    result = validate_task_dispatch_preflight(workspace, [], {})
+
+    assert [item.code for item in result.errors] == [
+        TaskDispatchPreflightCode.RECOVERY_REQUIRED,
+        TaskDispatchPreflightCode.EMPTY_SCOPE,
+    ]
+
+
 def test_claim_submits_action_once_and_tick_returns_without_waiting():
     client = FakeTaskClient(_workspace_response())
     started = threading.Event()
@@ -478,6 +1050,92 @@ def test_claim_submits_action_once_and_tick_returns_without_waiting():
     assert second["claimed"] == 0
     assert len(client.claims) == 1
     assert len(calls) == 1
+    release.set()
+    coordinator.shutdown()
+
+
+def test_action_runner_receives_complete_log_context():
+    response = _workspace_response()
+    response["workspace"]["task_instances"][0]["sample_id"] = "Sample A"
+    client = FakeTaskClient(response)
+    received_context = {}
+    finished = threading.Event()
+
+    def runner(node, _devices, _action_callable, context):
+        received_context.update(context)
+        finished.set()
+        return [{"success": True}]
+
+    coordinator = _coordinator(client, runner)
+    coordinator.cycle(
+        workflow_path=WORKFLOW_PATH,
+        workflow_nodes=[_node("node_001_pick_from_s03", "submit_pick_from_s03")],
+    )
+
+    assert finished.wait(timeout=1)
+    assert received_context["workflow_path"] == WORKFLOW_PATH
+    assert received_context["instance_id"] == "instance-1"
+    assert received_context["sample_id"] == "Sample A"
+    assert received_context["template_id"] == "template-1"
+    assert received_context["node_id"] == "node_001_pick_from_s03"
+    assert received_context["device_id"] == "device"
+    assert received_context["action_name"] == "submit_pick_from_s03"
+    assert received_context["execution_id"].startswith("task-action-")
+    coordinator.shutdown()
+
+
+def test_s04_stirring_dispatches_different_positions_concurrently():
+    instances = []
+    for instance_id, position in (("sample-a-stir", 1), ("sample-b-stir", 2)):
+        instances.append({
+            "id": instance_id,
+            "template_id": "template-1",
+            "status": "running",
+            "payload": {
+                "node_parameters": {
+                    "w04_run_stirring_s04": {"position": position},
+                }
+            },
+            "execution_state": {
+                "cursor": 0,
+                "records": [],
+                "active_execution_id": None,
+                "active_node_id": None,
+            },
+        })
+    client = FakeTaskClient(_workspace_response(
+        instances=instances,
+        node_ids=["w04_run_stirring_s04"],
+    ))
+    release = threading.Event()
+    started_positions = []
+
+    def runner(node, _devices, _action_callable):
+        started_positions.append(node.param["position"])
+        release.wait(timeout=2)
+        return [{"success": True}]
+
+    coordinator = _coordinator(
+        client,
+        runner,
+        devices={"szlab_s04_magnetic_stirring": FakeActionDevice()},
+    )
+    result = coordinator.cycle(
+        workflow_path=WORKFLOW_PATH,
+        workflow_nodes=[WorkflowNode(
+            uuid="w04_run_stirring_s04",
+            name="S04 magnetic stirring",
+            device_name="szlab_s04_magnetic_stirring",
+            method="run_stirring",
+            param={"position": 1},
+        )],
+    )
+
+    assert result["claimed"] == 2
+    deadline = time.monotonic() + 1
+    while len(started_positions) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert sorted(started_positions) == [1, 2]
     release.set()
     coordinator.shutdown()
 
@@ -625,6 +1283,10 @@ def test_succeed_transport_failure_retries_without_failing_or_rerunning():
     assert first_report["completed"] == 0
     assert first_report["failed"] == 0
     assert first_report["in_flight"] == 1
+    assert [item["code"] for item in first_report["diagnostics"]] == [
+        "terminal_report_failed"
+    ]
+    assert first_report["diagnostics"][0]["phase"] == "reporting"
     assert second_report["completed"] == 1
     assert client.succeed_attempts == 2
     assert client.succeeded[0]["result"] == [
@@ -654,6 +1316,13 @@ def test_submit_failure_is_reported_synchronously_and_pauses():
     assert result["claimed"] == 1
     assert result["failed"] == 1
     assert result["in_flight"] == 0
+    assert [item["code"] for item in result["diagnostics"]] == [
+        "action_dispatch_failed"
+    ]
+    assert result["diagnostics"][0]["phase"] == "dispatching"
+    assert result["diagnostics"][0]["execution_id"].startswith(
+        "task-action-"
+    )
     assert client.failed[0]["error"] == {
         "code": "action_dispatch_failed",
         "message": "executor unavailable",
@@ -974,6 +1643,7 @@ def test_paused_workspace_does_not_claim():
             "device_id": "",
             "action_name": "",
             "detail": {"status": 0},
+            "template_id": "template-1",
         }
     ]
 
@@ -1075,6 +1745,11 @@ def test_restart_fails_orphaned_server_execution_without_repeating_action():
     assert client.claims == []
     assert calls == []
     assert result["failed"] == 1
+    assert [item["code"] for item in result["diagnostics"]] == [
+        "orphaned_execution"
+    ]
+    assert result["diagnostics"][0]["execution_id"] == execution_id
+    assert result["diagnostics"][0]["phase"] == "recovering"
     assert client.failed == [{
         "workflow_path": WORKFLOW_PATH,
         "expected_version": 7,
@@ -1086,6 +1761,39 @@ def test_restart_fails_orphaned_server_execution_without_repeating_action():
             "message": "服务端存在活动执行但本地无对应 future，无法安全恢复",
         },
     }]
+
+
+def test_harvest_only_recovers_orphaned_execution_after_backend_restart():
+    instance = _workspace_response()["workspace"]["task_instances"][0]
+    execution_id = deterministic_execution_id(
+        instance["id"], 0, "node_001_pick_from_s03"
+    )
+    instance["execution_state"] = {
+        "cursor": 0,
+        "records": [{
+            "node_id": "node_001_pick_from_s03",
+            "execution_id": execution_id,
+            "status": "running",
+            "resources": ["robot"],
+        }],
+        "active_execution_id": execution_id,
+        "active_node_id": "node_001_pick_from_s03",
+    }
+    client = FakeTaskClient(_workspace_response(instances=[instance]))
+    calls = []
+    coordinator = _coordinator(client, lambda *_: calls.append(1))
+
+    result = coordinator.cycle(
+        workflow_path=WORKFLOW_PATH,
+        workflow_nodes=[],
+        harvest_only=True,
+    )
+
+    assert result["claimed"] == 0
+    assert result["failed"] == 1
+    assert calls == []
+    assert result["diagnostics"][0]["code"] == "orphaned_execution"
+    assert client.failed[0]["execution_id"] == execution_id
 
 
 def test_orphaned_execution_conflict_waits_then_retries_next_tick():
@@ -1413,6 +2121,10 @@ def test_terminal_report_response_loss_retries_idempotently():
     )
 
     assert first["in_flight"] == 1
+    assert [item["code"] for item in first["diagnostics"]] == [
+        "unsupported_action",
+        "terminal_report_failed",
+    ]
     assert recovered["in_flight"] == 0
     assert recovered["failed"] == 1
     assert len(client.fail_attempts) == 2
@@ -1454,6 +2166,11 @@ def test_non_retryable_terminal_conflict_is_retained_and_marks_failure():
         assert result["active"] == 1
         assert result["in_flight"] == 1
         assert result["failed"] == 0
+    assert [item["code"] for item in first["diagnostics"]] == [
+        "unsupported_action",
+        "terminal_report_failed",
+    ]
+    assert first["diagnostics"][1]["detail"]["retryable"] is False
     assert client.fail_attempts == 1
     assert len(coordinator._pending_terminal_reports) == 1
 

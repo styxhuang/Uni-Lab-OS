@@ -337,10 +337,14 @@ class SzlabMixerPhotoShottingDevice:
     def _wait_photo_result_code(self) -> tuple[Any, str]:
         last_code: Any = 0
         last_label = "UNKNOWN"
+        reader = self._plc_gateway if self._plc_gateway is not None else self._client
         while True:
             last_code = self._read_variable(S05_RESULT, use_cache=False)
             last_label = self._result_label(last_code)
             if last_label != "UNKNOWN":
+                return last_code, last_label
+            abort_check = getattr(reader, "_mixing_wait_should_abort", None)
+            if callable(abort_check) and abort_check():
                 return last_code, last_label
             time.sleep(1.0)
 
@@ -351,6 +355,7 @@ class SzlabMixerPhotoShottingDevice:
         photo_path: str = "",
         inspection_result: str = "",
         require_material: bool = False,
+        trigger_dissolution_detection: bool = True,
     ) -> dict[str, Any]:
         """
         Args:
@@ -358,6 +363,7 @@ class SzlabMixerPhotoShottingDevice:
             photo_path[照片路径]: 保留参数；相机照片链接接口接入后由设备侧获取。
             inspection_result[算法结果]: 保留参数；S05 当前按 PLC 拍照结果判断。
             require_material[要求有料]: 兼容旧工作流参数；实机动作始终要求拍照位置有料。
+            trigger_dissolution_detection[触发溶解检测]: 拍照成功后是否异步触发溶解检测。
         """
         del inspection_result, require_material
         self._status = "Running"
@@ -406,8 +412,13 @@ class SzlabMixerPhotoShottingDevice:
                 "success": False,
                 "message": f"S05 拍照检测 {result_label}",
                 "data": data,
-            }
-        data["dissolution_detection_triggered"] = self._start_dissolution_detection(sample_id)
+        }
+        if trigger_dissolution_detection:
+            data["dissolution_detection_triggered"] = self._start_dissolution_detection(
+                sample_id
+            )
+        else:
+            data["dissolution_detection_triggered"] = False
         return {
             "success": True,
             "message": f"S05 拍照检测完成，结果 {result_label}",

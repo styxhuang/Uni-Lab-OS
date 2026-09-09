@@ -20,6 +20,7 @@ from fastapi import HTTPException
 import scripts.run_workflow_local as run_workflow_local
 import scripts.workflow_ui as workflow_ui
 import scripts.opc_simulator_profiles as opc_simulator_profiles
+from scripts.run_history_store import RunHistoryStore
 from scripts.run_workflow_local import (
     WorkflowLogger,
     WorkflowNode,
@@ -70,6 +71,89 @@ def test_load_ai4c_preset():
     assert preset.default_config["show_csv"] is False
     assert preset.default_config["csv"] == "ai4c_sim_updated.csv"
     assert "pick_well_plate_from_loading_rack" in preset.actions
+
+
+def test_task_execution_log_contract_prefers_structured_fields_and_maps_legacy_logs(
+):
+    structured = workflow_ui._task_execution_log_contract(
+        "文本中出现 OPC 和失败也不得覆盖结构化分类",
+        level="warning",
+        detail={},
+        category="result",
+        code="action_returned_failure",
+        phase="completed",
+    )
+    assert structured == {
+        "category": "result",
+        "level": "warning",
+        "code": "action_returned_failure",
+        "phase": "completed",
+    }
+
+    legacy_opc = workflow_ui._task_execution_log_contract(
+        "Robot_Home 条件满足",
+        level="info",
+        detail={"type": "opc_wait", "phase": "finish"},
+    )
+    assert legacy_opc == {
+        "category": "opc",
+        "level": "info",
+        "code": "opc_wait",
+        "phase": "finish",
+    }
+
+    failed_opc_wait = workflow_ui._task_execution_log_contract(
+        "OPC 变量等待完成 ready == True: success=False, error=offline",
+        level="info",
+        detail={
+            "type": "opc_wait",
+            "phase": "finish",
+            "success": False,
+            "error": "offline",
+        },
+    )
+    assert failed_opc_wait == {
+        "category": "opc",
+        "level": "error",
+        "code": "opc_wait_read_failed",
+        "phase": "finish",
+    }
+
+    legacy_error = workflow_ui._task_execution_log_contract(
+        "节点执行失败: timeout",
+        level="info",
+        detail={},
+    )
+    assert legacy_error == {
+        "category": "action",
+        "level": "error",
+        "code": "action_log_error",
+        "phase": "executing",
+    }
+
+    legacy_opc_error = workflow_ui._task_execution_log_contract(
+        "OPC 变量读取失败",
+        level="info",
+        detail={},
+    )
+    assert legacy_opc_error == {
+        "category": "opc",
+        "level": "error",
+        "code": "opc",
+        "phase": "executing",
+    }
+
+    returned_failure = workflow_ui._task_execution_log_contract(
+        "动作结果: {'success': False}",
+        level="info",
+        detail={"result": {"success": False, "message": "设备拒绝执行"}},
+    )
+    assert returned_failure == {
+        "category": "result",
+        "level": "error",
+        "code": "action_returned_failure",
+        "phase": "executing",
+    }
 
 
 def test_ai4c_preset_csv_matches_default_opc_namespace():
@@ -741,6 +825,7 @@ def test_s09_debug_preset_uses_debug_file_name():
         )
     }
     assert "run_process" not in preset.actions
+    assert "measure_density" in preset.actions
     assert "go_to_safe_position" not in preset.actions
     assert "add_liquid" in preset.actions
     assert "add_liquid_to_beaker" in preset.actions
@@ -814,7 +899,11 @@ def test_szlab_robot_action_workflow_preset_includes_s03_to_s07_devices():
         preset.debug_config["skip_robot_precheck_variables"]
         == robot_action_preset.debug_config["skip_robot_precheck_variables"]
     )
-    assert preset.debug_config["env"]["SKIP_SENSOR_PRECHECK"] == "1"
+    assert "SKIP_SENSOR_PRECHECK" not in preset.debug_config.get("env", {})
+    assert (
+        "传感器状态_上位机[3].NO[0]"
+        not in preset.debug_config["skip_robot_precheck_variables"]
+    )
     assert runtime_config.device_factory.devices == {
         "szlab_poly_plc": "unilabos.devices.workstation.szlab_poly_studio.plc.SZLabPolyPLCDevice",
         "szlab_mixer_robot": "unilabos.devices.workstation.szlab_poly_studio.s12_robot.robot.SzlabMixerRobotDevice",
@@ -833,6 +922,7 @@ def test_szlab_robot_action_workflow_preset_includes_s03_to_s07_devices():
         == "szlab_mixer_pipetting_station"
     )
     assert "run_process" not in preset.actions
+    assert "measure_density" in preset.actions
     assert "add_liquid" in preset.actions
     assert "run_liquid_workflow" in preset.actions
     assert "get_pipetting_status" in preset.actions
@@ -849,6 +939,7 @@ def test_szlab_robot_action_workflow_preset_includes_s03_to_s07_devices():
         "release_station",
         "add_liquid",
         "add_liquid_with_reusable_tip",
+        "measure_density",
         "add_liquid_to_beaker",
         "run_liquid_workflow",
         "set_liquid_bottle_remaining_volume",
@@ -866,17 +957,20 @@ def test_szlab_robot_action_workflow_preset_includes_s03_to_s07_devices():
         "liquid_station_index",
         "solvent_batch_id",
         "volume",
-        "density_volume",
-        "density_measurement_count",
         "volume_unit",
         "skip_level_check",
+        "reuse_tip",
+        "liquid_count",
+        "liquid_additions",
+        "initialize_tip_inventory",
+        "initial_used_tip_count",
     ]
-    reusable_snapshot = collect_snapshot_variables(
-        "add_liquid_with_reusable_tip",
+    density_snapshot = collect_snapshot_variables(
+        "measure_density",
         {"density_measurement_count": 5},
         runtime_config,
     )
-    assert reusable_snapshot[-10:] == [
+    assert density_snapshot[-10:] == [
         *[f"S09抽液天平读数[{index}]" for index in range(5)],
         *[f"S09放液天平读数[{index}]" for index in range(5)],
     ]
@@ -1004,7 +1098,7 @@ def test_szlab_action_parameters_have_frontend_help_options_and_units():
     assert "S06" not in reusable_volume["description"]
     density_count = next(
         param
-        for param in preset.actions["add_liquid_with_reusable_tip"].params
+        for param in preset.actions["measure_density"].params
         if param["name"] == "density_measurement_count"
     )
     assert density_count["label"] == "测密度次数"
@@ -1053,7 +1147,7 @@ def test_szlab_robot_action_workflow_does_not_auto_apply_debug_sensor_skips(monk
     assert "SKIP_ROBOT_PRECHECK_VARIABLES" not in os.environ
 
 
-def test_szlab_robot_action_workflow_explicit_debug_skips_s03_pick_sensor_gate(
+def test_szlab_robot_action_workflow_explicit_debug_keeps_sensor_gates_enabled(
     monkeypatch,
 ):
     from unilabos.devices.workstation.szlab_poly_studio.s12_robot.robot import (
@@ -1065,11 +1159,34 @@ def test_szlab_robot_action_workflow_explicit_debug_skips_s03_pick_sensor_gate(
     apply_preset_debug_config("szlab_robot_action_workflow")
 
     device = SzlabMixerRobotDevice(auto_connect=False)
+    device._read_variable = lambda *_args, **_kwargs: False
     result = device._ensure_sensor_gate(
-        "传感器状态_上位机[0].NO[6]", True, "S03 取料源位必须有物料"
+        "传感器状态_上位机[3].NO[0]", True, "S05 必须有物料"
     )
 
-    assert result is None
+    assert result is not None
+    assert result["actual"] is False
+
+
+def test_s05_material_gate_cannot_be_skipped_by_debug_environment(monkeypatch):
+    from unilabos.devices.workstation.szlab_poly_studio.s12_robot.robot import (
+        SzlabMixerRobotDevice,
+    )
+
+    monkeypatch.setenv("SKIP_SENSOR_PRECHECK", "1")
+    monkeypatch.setenv(
+        "SKIP_ROBOT_PRECHECK_VARIABLES",
+        "传感器状态_上位机[3].NO[0]",
+    )
+    device = SzlabMixerRobotDevice(auto_connect=False)
+    device._read_variable = lambda *_args, **_kwargs: True
+
+    result = device._ensure_sensor_gate(
+        "传感器状态_上位机[3].NO[0]", False, "S05 放料目标位必须为空"
+    )
+
+    assert result is not None
+    assert result["actual"] is True
 
 
 def test_szlab_robot_action_workflow_flow_matches_requested_synthesis_route():
@@ -1106,6 +1223,54 @@ def test_szlab_robot_action_workflow_flow_matches_requested_synthesis_route():
     assert actions[8]["params"]["position"] == 1
     assert actions[8]["params"]["mode"] == 3
     assert actions[-1]["params"] == {"position": 1}
+
+
+def test_szlab_robot_action_workflow_photos_before_density_and_pours_after():
+    workflow = json.loads(
+        Path("szlab_robot_action_workflow.json").read_text(encoding="utf-8")
+    )
+    actions = [item["action"] for item in workflow["rules"][0]["actions"]]
+    node_ids = [action["workflow_node_id"] for action in actions]
+    actions_by_node_id = {
+        action["workflow_node_id"]: action
+        for action in actions
+    }
+
+    assert [action["index"] for action in actions] == list(range(1, 28))
+    assert len(node_ids) == len(set(node_ids))
+    assert node_ids[11:18] == [
+        "w04_run_stirring_s04",
+        "w06_pick_beaker_s04",
+        "w06_place_beaker_s05",
+        "w06_take_photo_s05",
+        "w06_pick_beaker_s05_for_density",
+        "w05_place_beaker_s09_for_density",
+        "w05_measure_density_s09",
+    ]
+    assert node_ids[21:24] == [
+        "w06_pick_beaker_s09_after_density",
+        "w07_pour_beaker_s08",
+        "w07_place_beaker_s11",
+    ]
+    assert (
+        actions_by_node_id["w06_take_photo_s05"]["params"][
+            "trigger_dissolution_detection"
+        ]
+        is True
+    )
+    assert not {
+        "w06_place_beaker_s05_after_density",
+        "w06_take_photo_s05_after_density",
+        "w07_pick_beaker_s05_after_density",
+    } & set(node_ids)
+    assert actions_by_node_id["w03_add_liquid_s09"]["params"]["liquid_additions"] == [
+        {
+            "liquid_station_index": 1,
+            "solvent_batch_id": "solvent-batch-001",
+            "volume": 5000,
+            "reuse_tip": True,
+        }
+    ]
 
 
 def test_ai4c_runtime_device_classes_are_importable():
@@ -1666,10 +1831,18 @@ def test_workflow_ui_main_uses_build_parser_and_preserves_cli_options(
     ]
 
 
-def test_workflow_run_manager_reuses_devices_between_runs(monkeypatch):
+def test_workflow_run_manager_reuses_devices_and_persists_direct_runs(
+    tmp_path,
+    monkeypatch,
+):
     preset = load_preset("ai4c")
     runtime_config = _load_preset_runtime_config(preset)
-    manager = WorkflowRunManager(preset, runtime_config)
+    history_store = RunHistoryStore(tmp_path, session_id="direct-workflows")
+    manager = WorkflowRunManager(
+        preset,
+        runtime_config,
+        run_history_store=history_store,
+    )
     created_devices = [{"AI4C_plc": object(), "AI4C_robot_arm": object()}]
     create_calls = []
     disconnect_calls = []
@@ -1724,6 +1897,13 @@ def test_workflow_run_manager_reuses_devices_between_runs(monkeypatch):
     assert disconnect_calls == []
     assert manager._records["run-1"].status == "completed"
     assert manager._records["run-2"].status == "completed"
+    assert (tmp_path / "history.db").exists()
+    actions = history_store.station_ledger("direct-workflows")["stations"][0][
+        "actions"
+    ]
+    assert len(actions) == 2
+    assert {action["instance_id"] for action in actions} == {"run-1", "run-2"}
+    assert {action["status"] for action in actions} == {"completed"}
 
 
 def test_workflow_manager_shutdown_waits_for_coordinator_before_devices(
@@ -2031,39 +2211,46 @@ def test_real_node_runner_wrappers_preserve_recursive_false_results():
         method="bare_false",
         legacy_route_compatible=False,
     )
-    helper_output = _run_node_with_live_opc_sampling(
-        helper_node,
-        {"device": device},
-        action_callable=device.bare_false,
-        logger=WorkflowLogger(writer=lambda *_args, **_kwargs: None),
-        runtime_config=runtime_config,
+    messages = []
+    logger = WorkflowLogger(
+        writer=lambda message, **_kwargs: messages.append(message)
     )
-    tuple_output = run_nodes(
-        [
-            WorkflowNode(
-                uuid="tuple-false",
-                name="auto-tuple_false",
-                device_name="device",
-                param={},
-            )
-        ],
-        {"device": device},
-        logger=WorkflowLogger(writer=lambda *_args, **_kwargs: None),
-        runtime_config=runtime_config,
-    )
-    nested_output = run_nodes(
-        [
-            WorkflowNode(
-                uuid="nested-false",
-                name="auto-nested_false",
-                device_name="device",
-                param={},
-            )
-        ],
-        {"device": device},
-        logger=WorkflowLogger(writer=lambda *_args, **_kwargs: None),
-        runtime_config=runtime_config,
-    )
+    with pytest.raises(workflow_ui.ActionReturnedFailure) as bare_failure:
+        _run_node_with_live_opc_sampling(
+            helper_node,
+            {"device": device},
+            action_callable=device.bare_false,
+            logger=logger,
+            runtime_config=runtime_config,
+        )
+    with pytest.raises(workflow_ui.ActionReturnedFailure) as tuple_failure:
+        run_nodes(
+            [
+                WorkflowNode(
+                    uuid="tuple-false",
+                    name="auto-tuple_false",
+                    device_name="device",
+                    param={},
+                )
+            ],
+            {"device": device},
+            logger=logger,
+            runtime_config=runtime_config,
+        )
+    with pytest.raises(workflow_ui.ActionReturnedFailure) as nested_failure:
+        run_nodes(
+            [
+                WorkflowNode(
+                    uuid="nested-false",
+                    name="auto-nested_false",
+                    device_name="device",
+                    param={},
+                )
+            ],
+            {"device": device},
+            logger=logger,
+            runtime_config=runtime_config,
+        )
     normal_output = run_nodes(
         [
             WorkflowNode(
@@ -2078,9 +2265,14 @@ def test_real_node_runner_wrappers_preserve_recursive_false_results():
         runtime_config=runtime_config,
     )
 
-    assert _false_result(helper_output) is not None
-    assert _false_result(tuple_output) is not None
-    assert _false_result(nested_output) is not None
+    assert bare_failure.value.failure is False
+    assert tuple_failure.value.failure == (False, "failed")
+    assert nested_failure.value.failure == {"success": False}
+    result_messages = [
+        message for message in messages if message.startswith("动作结果")
+    ]
+    assert len(result_messages) == 3
+    assert result_messages[0] == "动作结果：失败 · False"
     assert _false_result(normal_output) is None
 
 
@@ -2171,6 +2363,68 @@ def test_run_node_with_live_opc_sampling_emits_opc_wait_events(tmp_path):
     ]
     assert wait_events[0]["detail"]["phase"] == "start"
     assert wait_events[1]["detail"]["phase"] == "finish"
+
+
+def test_run_node_with_live_opc_sampling_marks_failed_wait_as_error():
+    class FailedWaitDevice:
+        def run(self):
+            return {"success": True}
+
+        @staticmethod
+        def drain_opc_wait_events():
+            return [
+                {
+                    "phase": "finish",
+                    "message": (
+                        "OPC 变量等待完成 ready == True: "
+                        "success=False, last_value=None, error=offline"
+                    ),
+                    "detail": {
+                        "type": "opc_wait",
+                        "phase": "finish",
+                        "variable": "ready",
+                        "expected": True,
+                        "success": False,
+                        "last_value": None,
+                        "error": "offline",
+                    },
+                }
+            ]
+
+    device = FailedWaitDevice()
+    events = []
+    runtime_config = run_workflow_local.RuntimeConfig(
+        path=Path("runtime.json"),
+        device_factory=run_workflow_local.RuntimeDeviceFactoryConfig(),
+        opc_snapshot=run_workflow_local.RuntimeOpcSnapshotConfig(),
+    )
+
+    _run_node_with_live_opc_sampling(
+        WorkflowNode(
+            uuid="failed-wait",
+            name="run",
+            device_name="device",
+            method="run",
+            param={},
+            legacy_route_compatible=False,
+        ),
+        {"device": device},
+        action_callable=device.run,
+        logger=WorkflowLogger(
+            writer=lambda message, **kwargs: events.append(
+                {"message": message, **kwargs}
+            )
+        ),
+        runtime_config=runtime_config,
+    )
+
+    failed_wait = next(
+        event
+        for event in events
+        if (event.get("detail") or {}).get("type") == "opc_wait"
+    )
+    assert failed_wait["level"] == "error"
+    assert failed_wait["detail"]["success"] is False
 
 
 def test_run_node_with_live_opc_sampling_emits_nested_client_wait_events(tmp_path):
@@ -2545,12 +2799,17 @@ def test_task_opc_connect_distributes_registry_without_reading_all_plc_variables
     assert distributions == [({"szlab_poly_plc": fake_plc}, "task-flow.json", False)]
 
 
-def test_task_opc_connect_returns_clear_backend_failure(monkeypatch):
+def test_task_opc_connect_returns_clear_backend_failure(monkeypatch, tmp_path):
     def fail_connect(self, **_kwargs):
         raise ValueError("PLC 连接失败：认证被拒绝")
 
     monkeypatch.setattr(WorkflowRunManager, "connect_task_opc", fail_connect)
-    app = create_app("stack_s05_s06")
+    app = create_app(
+        "stack_s05_s06",
+        run_history_store=RunHistoryStore(
+            tmp_path, session_id="opc-connect-error"
+        ),
+    )
     endpoint = next(
         route.endpoint
         for route in app.routes
@@ -2576,6 +2835,15 @@ def test_task_opc_connect_returns_clear_backend_failure(monkeypatch):
             "registered_variables": [],
         },
     }
+    get_logs = _route_endpoint(app, "/api/task-execution/logs", "GET")
+    entries = asyncio.run(
+        get_logs(task_workspace_path="task-flow.json")
+    )["entries"]
+    assert len(entries) == 1
+    assert entries[0]["category"] == "opc"
+    assert entries[0]["level"] == "error"
+    assert entries[0]["code"] == "opc_connection_failed"
+    assert entries[0]["phase"] == "connecting"
 
 
 def test_task_opc_poll_delegates_to_manager(monkeypatch):
@@ -2654,6 +2922,457 @@ def test_task_execution_tick_delegates_and_returns_cycle_statistics(monkeypatch)
         "completed": 0,
         "failed": 0,
     }
+
+
+def test_task_workflow_fingerprint_is_canonical_and_content_sensitive():
+    first = {
+        "nodes": [{
+            "workflow_node_id": "task-node",
+            "device_id": "device",
+            "method": "run",
+            "params": {"speed": 10},
+        }],
+        "edges": [],
+    }
+    reordered = {
+        "edges": [],
+        "nodes": [{
+            "params": {"speed": 10},
+            "method": "run",
+            "device_id": "device",
+            "workflow_node_id": "task-node",
+        }],
+    }
+    changed = {
+        **first,
+        "nodes": [{**first["nodes"][0], "params": {"speed": 20}}],
+    }
+
+    fingerprint = workflow_ui._task_workflow_fingerprint(first)
+
+    assert fingerprint.startswith("sha256:")
+    assert fingerprint == workflow_ui._task_workflow_fingerprint(reordered)
+    assert fingerprint != workflow_ui._task_workflow_fingerprint(changed)
+
+
+def test_workflow_manager_preflight_returns_version_fingerprint_and_errors(
+    tmp_path,
+):
+    class FakeDevice:
+        def run(self):
+            return None
+
+    class FakeSnapshotPublisher:
+        def __init__(self):
+            self.response = {
+                "version": 7,
+                "workspace": {
+                    "templates": [{
+                        "id": "template-1",
+                        "name": "样品处理",
+                        "node_ids": ["task-node"],
+                    }],
+                    "scheduled_template_ids": ["template-1"],
+                    "task_instances": [],
+                    "pause_reason": None,
+                },
+            }
+
+        def get_workspace(self, *, workflow_path):
+            assert workflow_path == "task-flow.json"
+            return self.response
+
+    workflow = {
+        "nodes": [{
+            "workflow_node_id": "task-node",
+            "device_id": "device",
+            "method": "run",
+            "params": {},
+        }],
+        "edges": [],
+    }
+    preset = load_preset("szlab_robot_action_workflow")
+    manager = WorkflowRunManager(
+        preset,
+        _load_preset_runtime_config(preset),
+        run_history_store=RunHistoryStore(tmp_path, session_id="preflight"),
+    )
+    manager._task_snapshot_publisher = FakeSnapshotPublisher()
+    manager._cached_devices = {"device": FakeDevice()}
+    try:
+        valid = manager.preflight_task_dispatch(
+            workflow_path="task-flow.json",
+            expected_version=7,
+            workflow_payload=workflow,
+        )
+        missing = manager.preflight_task_dispatch(
+            workflow_path="task-flow.json",
+            expected_version=7,
+            workflow_payload={"nodes": [], "edges": []},
+        )
+    finally:
+        manager.shutdown()
+
+    assert valid == {
+        "valid": True,
+        "errors": [],
+        "warnings": [],
+        "workspace_version": 7,
+        "workflow_fingerprint": workflow_ui._task_workflow_fingerprint(workflow),
+    }
+    assert missing["valid"] is False
+    assert missing["errors"][0]["code"] == "task_node_missing"
+    assert missing["workspace_version"] == 7
+
+
+def test_workflow_manager_preflight_rejects_stale_workspace_version(
+    tmp_path,
+):
+    class FakeSnapshotPublisher:
+        def get_workspace(self, *, workflow_path):
+            assert workflow_path == "task-flow.json"
+            return {"version": 8, "workspace": {}}
+
+    preset = load_preset("szlab_robot_action_workflow")
+    manager = WorkflowRunManager(
+        preset,
+        _load_preset_runtime_config(preset),
+        run_history_store=RunHistoryStore(tmp_path, session_id="preflight-conflict"),
+    )
+    manager._task_snapshot_publisher = FakeSnapshotPublisher()
+    try:
+        with pytest.raises(TaskApiConflict) as caught:
+            manager.preflight_task_dispatch(
+                workflow_path="task-flow.json",
+                expected_version=7,
+                workflow_payload={"nodes": [], "edges": []},
+            )
+    finally:
+        manager.shutdown()
+
+    assert caught.value.code == "version_conflict"
+    assert "expected=7, actual=8" in str(caught.value)
+
+
+def test_workflow_manager_execution_cycle_hard_gates_invalid_preflight(
+    tmp_path,
+    monkeypatch,
+):
+    class FakeDevice:
+        def run(self):
+            return None
+
+    class FakeSnapshotPublisher:
+        def get_workspace(self, *, workflow_path):
+            assert workflow_path == "task-flow.json"
+            return {
+                "version": 9,
+                "workspace": {
+                    "scheduler_paused": False,
+                    "pause_reason": None,
+                    "templates": [{
+                        "id": "template-1",
+                        "name": "样品处理",
+                        "node_ids": ["task-node"],
+                    }],
+                    "scheduled_template_ids": ["template-1"],
+                    "task_instances": [{
+                        "id": "instance-1",
+                        "template_id": "template-1",
+                        "status": "running",
+                    }],
+                },
+            }
+
+    preset = load_preset("szlab_robot_action_workflow")
+    manager = WorkflowRunManager(
+        preset,
+        _load_preset_runtime_config(preset),
+        run_history_store=RunHistoryStore(tmp_path, session_id="hard-gate"),
+    )
+    manager._task_snapshot_publisher = FakeSnapshotPublisher()
+    manager._cached_devices = {"device": FakeDevice()}
+    cycle_calls = []
+    published = []
+
+    def fake_cycle(**kwargs):
+        cycle_calls.append(kwargs)
+        return {
+            "success": True,
+            "active": 1,
+            "in_flight": 1,
+            "claimed": 0,
+            "completed": 1,
+            "failed": 0,
+            "diagnostics": [],
+        }
+
+    monkeypatch.setattr(manager._task_execution_coordinator, "cycle", fake_cycle)
+    monkeypatch.setattr(
+        manager,
+        "_publish_task_scheduler_errors",
+        lambda **kwargs: published.append(kwargs),
+    )
+    try:
+        result = manager.run_task_execution_cycle(
+            workflow_path="task-flow.json",
+            workflow_payload={
+                "nodes": [{
+                    "workflow_node_id": "standalone-node",
+                    "device_id": "device",
+                    "method": "run",
+                    "params": {},
+                }],
+                "edges": [],
+            },
+        )
+    finally:
+        manager.shutdown()
+
+    assert result["success"] is False
+    assert result["code"] == "task_dispatch_preflight_failed"
+    assert result["claimed"] == 0
+    assert result["completed"] == 1
+    assert result["message"].startswith("派发预检未通过：")
+    assert result["preflight"]["workspace_version"] == 9
+    assert result["preflight"]["errors"][0]["code"] == "task_node_missing"
+    assert result["diagnostics"][0]["instance_id"] == "instance-1"
+    assert result["diagnostics"][0]["immediate"] is True
+    assert cycle_calls[0]["harvest_only"] is True
+    assert published[0]["diagnostics"] == result["diagnostics"]
+
+
+def test_workflow_manager_execution_cycle_dispatches_after_server_preflight(
+    tmp_path,
+    monkeypatch,
+):
+    class FakeDevice:
+        def run(self):
+            return None
+
+    class FakeSnapshotPublisher:
+        def get_workspace(self, *, workflow_path):
+            assert workflow_path == "task-flow.json"
+            return {
+                "version": 3,
+                "workspace": {
+                    "scheduler_paused": False,
+                    "pause_reason": None,
+                    "templates": [{
+                        "id": "template-1",
+                        "node_ids": ["task-node"],
+                    }],
+                    "scheduled_template_ids": ["template-1"],
+                    "task_instances": [],
+                },
+            }
+
+    preset = load_preset("szlab_robot_action_workflow")
+    manager = WorkflowRunManager(
+        preset,
+        _load_preset_runtime_config(preset),
+        run_history_store=RunHistoryStore(tmp_path, session_id="hard-gate-valid"),
+    )
+    manager._task_snapshot_publisher = FakeSnapshotPublisher()
+    manager._cached_devices = {"device": FakeDevice()}
+    cycle_calls = []
+
+    def fake_cycle(**kwargs):
+        cycle_calls.append(kwargs)
+        return {
+            "success": True,
+            "active": 1,
+            "in_flight": 0,
+            "claimed": 1,
+            "completed": 0,
+            "failed": 0,
+            "diagnostics": [],
+        }
+
+    monkeypatch.setattr(manager._task_execution_coordinator, "cycle", fake_cycle)
+    monkeypatch.setattr(
+        manager,
+        "_publish_task_scheduler_errors",
+        lambda **_kwargs: None,
+    )
+    try:
+        result = manager.run_task_execution_cycle(
+            workflow_path="task-flow.json",
+            workflow_payload={
+                "nodes": [{
+                    "workflow_node_id": "task-node",
+                    "device_id": "device",
+                    "method": "run",
+                    "params": {},
+                }],
+                "edges": [],
+            },
+        )
+    finally:
+        manager.shutdown()
+
+    assert result["success"] is True
+    assert result["claimed"] == 1
+    assert cycle_calls[0]["harvest_only"] is False
+    assert [node.uuid for node in cycle_calls[0]["workflow_nodes"]] == [
+        "task-node"
+    ]
+
+
+def test_task_execution_preflight_endpoint_delegates_and_returns_result(
+    monkeypatch,
+):
+    workflow = {"nodes": [], "edges": []}
+
+    def fake_preflight(
+        self, *, workflow_path, expected_version, workflow_payload
+    ):
+        assert workflow_path == "task-flow.json"
+        assert expected_version == 7
+        assert workflow_payload is workflow
+        return {
+            "valid": True,
+            "errors": [],
+            "warnings": [],
+            "workspace_version": 7,
+            "workflow_fingerprint": "sha256:valid",
+        }
+
+    monkeypatch.setattr(
+        WorkflowRunManager,
+        "preflight_task_dispatch",
+        fake_preflight,
+    )
+    app = create_app("szlab_robot_action_workflow")
+    endpoint = _route_endpoint(app, "/api/task-execution/preflight", "POST")
+
+    response = asyncio.run(endpoint({
+        "task_workspace_path": "task-flow.json",
+        "expected_version": 7,
+        "workflow": workflow,
+    }))
+
+    assert response["valid"] is True
+    assert response["workflow_fingerprint"] == "sha256:valid"
+
+
+def test_task_execution_preflight_endpoint_returns_structured_422(monkeypatch):
+    result = {
+        "valid": False,
+        "errors": [{"code": "task_node_missing", "node_id": "task-node"}],
+        "warnings": [],
+        "workspace_version": 7,
+        "workflow_fingerprint": "sha256:invalid",
+    }
+    monkeypatch.setattr(
+        WorkflowRunManager,
+        "preflight_task_dispatch",
+        lambda self, **kwargs: result,
+    )
+    app = create_app("szlab_robot_action_workflow")
+    endpoint = _route_endpoint(app, "/api/task-execution/preflight", "POST")
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(endpoint({
+            "task_workspace_path": "task-flow.json",
+            "expected_version": 7,
+            "workflow": {"nodes": [], "edges": []},
+        }))
+
+    assert caught.value.status_code == 422
+    assert caught.value.detail == result
+
+
+def test_task_execution_preflight_endpoint_maps_version_conflict_to_409(
+    monkeypatch,
+):
+    def conflict(self, **kwargs):
+        raise TaskApiConflict("version_conflict", "workspace changed")
+
+    monkeypatch.setattr(
+        WorkflowRunManager,
+        "preflight_task_dispatch",
+        conflict,
+    )
+    app = create_app("szlab_robot_action_workflow")
+    endpoint = _route_endpoint(app, "/api/task-execution/preflight", "POST")
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(endpoint({
+            "task_workspace_path": "task-flow.json",
+            "expected_version": 7,
+            "workflow": {"nodes": [], "edges": []},
+        }))
+
+    assert caught.value.status_code == 409
+    assert caught.value.detail == {
+        "code": "version_conflict",
+        "message": "workspace changed",
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"expected_version": 7, "workflow": {}},
+        {"task_workspace_path": "task-flow.json", "workflow": {}},
+        {
+            "task_workspace_path": "task-flow.json",
+            "expected_version": True,
+            "workflow": {},
+        },
+        {
+            "task_workspace_path": "task-flow.json",
+            "expected_version": 7,
+        },
+    ],
+)
+def test_task_execution_preflight_endpoint_rejects_incomplete_request(payload):
+    app = create_app("szlab_robot_action_workflow")
+    endpoint = _route_endpoint(app, "/api/task-execution/preflight", "POST")
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(endpoint(payload))
+
+    assert caught.value.status_code == 422
+    assert caught.value.detail["code"] == "preflight_request_invalid"
+
+
+def test_task_execution_timings_endpoint_persists_entries(monkeypatch):
+    captured = {}
+
+    def fake_append(self, *, workflow_path, entries):
+        captured["workflow_path"] = workflow_path
+        captured["entries"] = entries
+        return len(entries)
+
+    monkeypatch.setattr(
+        WorkflowRunManager,
+        "append_task_execution_timings",
+        fake_append,
+    )
+    app = create_app("szlab_robot_action_workflow")
+    endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/api/task-execution/timings"
+    )
+    entries = [
+        {
+            "cycle_id": 4,
+            "step": "execution_tick",
+            "phase": "finish",
+            "timestamp_ms": 12_345,
+            "duration_ms": 25,
+        }
+    ]
+
+    response = asyncio.run(
+        endpoint({"task_workspace_path": "task-flow.json", "entries": entries})
+    )
+
+    assert response == {"success": True, "written": 1}
+    assert captured == {"workflow_path": "task-flow.json", "entries": entries}
 
 
 def test_temporary_s072_triggers_follow_successful_place_and_pick_records():

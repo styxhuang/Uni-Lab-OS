@@ -1,4 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  automaticActionParameterDescription,
+  isAutomaticallyManagedActionParameter,
+  stripAutomaticallyManagedActionParameters,
+} from './automaticActionParameters';
 import ReactDOM from 'react-dom/client';
 import ReactFlow, {
   Background,
@@ -69,6 +74,7 @@ import {
 import {
   buildTaskProcessLogLines,
   buildTaskVariableRows,
+  fetchAllTaskActionLogs,
   fetchTaskActionLogs,
   groupTaskActionLogsByNode,
   mergeTaskActionLogs,
@@ -81,7 +87,19 @@ import {
 } from './taskLogSession';
 import { TASK_EXECUTION_POLL_INTERVAL_MS } from './taskPolling';
 import {
+  canStartTaskDispatch,
+  currentTaskDispatchReadiness,
+  isTaskDispatchPreflightResult,
+  preflightTaskDispatch,
+  taskDispatchIssueResolution,
+  TaskDispatchPreflightHttpError,
+  type TaskDispatchPreflightIssue,
+  type TaskDispatchPreflightResult,
+  type TaskDispatchReadiness,
+} from './taskDispatchPreflight';
+import {
   createEmptyTaskTestMemory,
+  generateSampleIds,
   loadTaskTestMemory,
   rememberedParametersForSamples,
   rememberedSampleTemplateCount,
@@ -104,6 +122,7 @@ import {
   formatElapsedDurationMs,
   formatTaskActionTimingTitle,
   isTaskWaitingStatus,
+  orderSelectedTemplateIds,
   renameTaskTemplate,
   resolveTaskTemplateNameDraft,
   resolveTemplateNodes,
@@ -111,7 +130,7 @@ import {
   taskLocalWaitingReason,
   updateScheduledTemplateDraft,
 } from './taskOrchestration';
-import type { TaskActionExecutionRecord, TriggerCondition } from './taskOrchestration';
+import type { TaskActionExecutionRecord, TaskDependencyModel, TriggerCondition } from './taskOrchestration';
 import {
   createTaskExecutionController,
   createTaskExecutionStatus,
@@ -163,6 +182,7 @@ type CanvasLiquidAddition = {
   liquid_station_index: number | string;
   solvent_batch_id: string;
   volume: number | string;
+  reuse_tip: boolean;
 };
 
 type CanvasS09TipStatus = {
@@ -181,7 +201,7 @@ const CANVAS_S07_POWDER_PARAMETERS = new Set([
   'coarse_position', 'fine_position', 'target_weight', 'recipe_name', 'params_json', 'powder_count', 'powder_additions',
 ]);
 const CANVAS_S09_LIQUID_PARAMETERS = new Set([
-  'liquid_station_index', 'solvent_batch_id', 'volume', 'liquid_count', 'liquid_additions', 'measure_density',
+  'liquid_station_index', 'solvent_batch_id', 'volume', 'reuse_tip', 'liquid_count', 'liquid_additions',
   'initialize_tip_inventory', 'initial_used_tip_count',
 ]);
 
@@ -221,9 +241,10 @@ function canvasLiquidAdditions(params: Record<string, unknown>): CanvasLiquidAdd
     liquid_station_index: Number(params.liquid_station_index ?? 1),
     solvent_batch_id: String(params.solvent_batch_id ?? ''),
     volume: Number(params.volume ?? 1),
+    reuse_tip: true,
   }];
   const count = Math.max(1, Math.floor(Number(params.liquid_count) || 1));
-  while (additions.length < count) additions.push({ liquid_station_index: 1, solvent_batch_id: '', volume: '' });
+  while (additions.length < count) additions.push({ liquid_station_index: 1, solvent_batch_id: '', volume: '', reuse_tip: true });
   return additions;
 }
 
@@ -278,6 +299,7 @@ type TaskTemplate = {
   gates: string[];
   inputTriggers: TriggerCondition[];
   outputTriggers: TriggerCondition[];
+  dependencies: TaskDependencyModel[] | null;
 };
 type CsvVariable = {
   name: string;
@@ -336,14 +358,24 @@ function taskTriggerLogLabel(trigger: unknown) {
 }
 
 function taskEventText(event: ApiWorkspaceEvent, fallbackTriggers: unknown[] = []) {
-  const timestamp = new Date(event.timestamp).toLocaleTimeString('zh-CN', { hour12: false });
   const satisfiedTriggers = event.payload.satisfied_triggers;
   if (event.kind === 'scheduled') {
     const triggers = Array.isArray(satisfiedTriggers) ? satisfiedTriggers : fallbackTriggers;
     const conditions = triggers.map(taskTriggerLogLabel).join('、');
-    return `${timestamp} 已派发：${conditions || '无额外输入条件'}`;
+    return `已派发：${conditions || '无额外输入条件'}`;
   }
-  return `${timestamp} ${event.kind}`;
+  const labels: Record<string, string> = {
+    opc_snapshot: 'OPC 快照已更新',
+    output: '输出条件已记录',
+    completed: 'Task 已完成',
+    template_deleted: 'Task 模板已删除',
+    templates_deleted: 'Task 模板已批量删除',
+    scheduled_templates_updated: '待排 Task 模板已更新',
+    instances_cleared: 'Task 队列已清空',
+    instances_progress_reset: 'Task 进度已重置',
+    instance_parameters_updated: 'Task 参数已更新',
+  };
+  return labels[event.kind] || event.kind;
 }
 
 function taskWaitingText(reason?: ApiWaitingReason) {
@@ -377,9 +409,21 @@ function taskWorkspaceFromApi(response: ApiWorkspaceResponse): TaskWorkspaceStat
   }>;
 } {
   const templateById = new Map(response.workspace.templates.map((template) => [template.id, template]));
+  const instanceById = new Map(response.workspace.task_instances.map((instance) => [instance.id, instance]));
   const taskEventRecords = response.workspace.events.map((event) => ({
+    id: event.id,
     kind: event.kind,
     timestamp: event.timestamp,
+    instanceId: event.instance_id || undefined,
+    sampleId: event.instance_id ? instanceById.get(event.instance_id)?.sample_id : undefined,
+    templateId: event.template_id || undefined,
+    nodeId: typeof event.payload.node_id === 'string' ? event.payload.node_id : undefined,
+    executionId: typeof event.payload.execution_id === 'string' ? event.payload.execution_id : undefined,
+    category: 'schedule' as const,
+    level: 'info',
+    code: event.kind,
+    phase: 'scheduling',
+    detail: event.payload,
     text: taskEventText(
       event,
       event.template_id
@@ -399,6 +443,12 @@ function taskWorkspaceFromApi(response: ApiWorkspaceResponse): TaskWorkspaceStat
       gates: [],
       inputTriggers: template.input_triggers.map(fromApiTrigger),
       outputTriggers: template.output_triggers.map(fromApiTrigger),
+      dependencies: template.dependencies == null
+        ? null
+        : template.dependencies.map((dependency) => ({
+            templateId: dependency.template_id,
+            nodeId: dependency.node_id ?? null,
+          })),
     })),
     taskInstances: response.workspace.task_instances.map((instance) => ({
       id: instance.id,
@@ -416,6 +466,7 @@ function taskWorkspaceFromApi(response: ApiWorkspaceResponse): TaskWorkspaceStat
         status: record.status,
         startedAt: record.started_at ?? undefined,
         finishedAt: record.finished_at ?? undefined,
+        error: record.error ?? null,
       })),
       nodeParameters: instance.payload?.node_parameters || {},
     })),
@@ -436,6 +487,12 @@ function taskApiErrorMessage(error: unknown) {
     return 'Task API 未找到该接口，请重启 task-orchestration 服务（8091）后再试';
   }
   if (error instanceof TaskOrchestrationBusinessError && error.status === 409) {
+    if (
+      error.message.includes('resetting task progress')
+      || error.message.includes('active actions')
+    ) {
+      return '请先暂停派发并等待当前动作完成，再重置进度';
+    }
     if (error.message.includes('pause scheduler')) {
       return '请先点击「暂停派发」后再清空队列';
     }
@@ -631,8 +688,6 @@ const LIVE_SENSOR_GATE_BITS: Record<string, Array<[number, number]>> = {
   s08: [[3, 14], [3, 15]],
   s09: [[4, 7]],
 };
-const SAMPLE_NAMES = ['Sample A', 'Sample B', 'Sample C', 'Sample D', 'Sample E'];
-
 function orderSelectedNodesByPlan(
   selectedNodes: Node<ActionNodeData>[],
   plannedNodes: Node<ActionNodeData>[],
@@ -800,6 +855,7 @@ function App() {
   const [edges, setEdges] = useState<Edge[]>([]);
   const [workflowName, setWorkflowName] = useState('szlab_canvas_workflow');
   const [workflow, setWorkflow] = useState<WorkflowJson | null>(null);
+  const [builtWorkflowSemanticKey, setBuiltWorkflowSemanticKey] = useState('');
   const [message, setMessage] = useState('');
   const [canvasToast, setCanvasToast] = useState('');
   const [draftReady, setDraftReady] = useState(false);
@@ -867,6 +923,7 @@ function App() {
   const [taskActionLogs, setTaskActionLogs] = useState<TaskActionLogEntry[]>([]);
   const [taskLogError, setTaskLogError] = useState('');
   const [taskLogSession, setTaskLogSession] = useState<TaskLogSession | null>(null);
+  const [isTaskLogBootstrapped, setIsTaskLogBootstrapped] = useState(false);
   const taskLogAfterSeqRef = useRef(0);
   const taskLogBootstrappedRef = useRef(false);
   const [isSchedulerRunning, setIsSchedulerRunning] = useState(false);
@@ -877,6 +934,11 @@ function App() {
   const [taskExecutionStatus, setTaskExecutionStatus] = useState<TaskExecutionStatus>(
     createTaskExecutionStatus(),
   );
+  const [taskDispatchReadiness, setTaskDispatchReadiness] = useState<TaskDispatchReadiness>({
+    status: 'stale',
+    key: '',
+  });
+  const [taskDispatchPreflightRevision, setTaskDispatchPreflightRevision] = useState(0);
   const [showOpcSimulatorDialog, setShowOpcSimulatorDialog] = useState(false);
   const [showOpcSimulatorReferenceDialog, setShowOpcSimulatorReferenceDialog] = useState(false);
   const [showOpcSimulatorSpecDialog, setShowOpcSimulatorSpecDialog] = useState(false);
@@ -923,6 +985,7 @@ function App() {
   const taskRequestQueueRef = useRef<Promise<void>>(Promise.resolve());
   const taskSchedulerTransitionRef = useRef(false);
   const taskExecutionControllerRef = useRef<ReturnType<typeof createTaskExecutionController> | null>(null);
+  const taskDispatchPreflightKeyRef = useRef('');
   const opcSimulatorClientRef = useRef(createOpcSimulatorClient());
   const ownedOpcSimulatorRunIdRef = useRef<string | null>(null);
   const opcSimulatorStatusRef = useRef<OpcSimulatorStatus | null>(null);
@@ -1033,8 +1096,18 @@ function App() {
       ),
       onStatus: setTaskExecutionStatus,
       onError: setTaskServiceError,
+      onPreflightRejected: (preflight, errorMessage) => {
+        setTaskExecutionWorkflow(null);
+        if (!isTaskDispatchPreflightResult(preflight)) return;
+        setTaskDispatchReadiness({
+          status: 'invalid',
+          key: taskDispatchPreflightKeyRef.current,
+          result: preflight,
+          message: `服务端派发前复核未通过，已停止自动派发。${errorMessage}`,
+          source: 'dispatch',
+        });
+      },
       onDrainingChange: setIsTaskExecutionDraining,
-      getLatestVersion: () => taskWorkspaceVersionRef.current,
     });
   }
   const resetTaskWorkspace = useCallback(() => {
@@ -1142,6 +1215,58 @@ function App() {
   const opcChanges = useMemo(() => collectOpcChanges(logEvents), [logEvents]);
   const draftKey = useMemo(() => workflowDraftKey(workflowName, nodes, edges), [workflowName, nodes, edges]);
   const executionPlan = useMemo(() => createExecutionPlan(nodes, edges, startNodeId), [edges, nodes, startNodeId]);
+  const taskWorkflowSemanticKey = useMemo(() => JSON.stringify({
+    name: workflowName,
+    startNodeId: executionPlan.startNodeId,
+    nodes: executionPlan.executableNodes.map((node) => ({
+      id: node.id,
+      deviceId: node.data.deviceId,
+      method: node.data.method,
+      params: node.data.params,
+      opcVariables: node.data.opcVariables,
+    })),
+    edges: executionPlan.executableEdges.map((edge) => ({
+      source: edge.source,
+      target: edge.target,
+    })),
+  }), [executionPlan, workflowName]);
+  const hasTaskWorkspaceVersion = taskWorkspaceVersion !== null;
+  const taskDispatchPreflightKey = useMemo(() => JSON.stringify({
+    workflowPath: taskWorkspacePath,
+    taskWorkflowSemanticKey,
+    builtWorkflowSemanticKey,
+    workflow,
+    templates: taskTemplates.map((template) => ({
+      id: template.id,
+      nodeIds: template.nodeIds,
+      dependencies: template.dependencies,
+    })),
+    scheduledTemplateIds,
+    instances: taskInstances.map((instance) => ({
+      id: instance.id,
+      templateId: instance.templateId,
+      status: instance.status,
+      executionCursor: instance.executionCursor,
+    })),
+    opcConnected: Boolean(taskOpcStatus?.connected),
+  }), [
+    builtWorkflowSemanticKey,
+    scheduledTemplateIds,
+    taskInstances,
+    taskOpcStatus?.connected,
+    taskTemplates,
+    taskWorkspacePath,
+    taskWorkflowSemanticKey,
+    workflow,
+  ]);
+  const visibleTaskDispatchReadiness = useMemo(
+    () => currentTaskDispatchReadiness(
+      taskDispatchReadiness,
+      taskDispatchPreflightKey,
+    ),
+    [taskDispatchPreflightKey, taskDispatchReadiness],
+  );
+  taskDispatchPreflightKeyRef.current = taskDispatchPreflightKey;
   const renderedEdges = useMemo(() => {
     const executableEdgeEndpoints = new Set(
       executionPlan.executableEdges.map((edge) => JSON.stringify([edge.source, edge.target])),
@@ -1218,6 +1343,43 @@ function App() {
   const selectedTaskProcessLines = useMemo(
     () => selectedTaskLogSections.flatMap((section) => buildTaskProcessLogLines(section.entries)),
     [selectedTaskLogSections],
+  );
+  const selectedTaskPersistentErrors = useMemo(
+    () => (selectedTaskInstance?.actionRecords || [])
+      .filter((record) => record.status === 'failed' && record.error)
+      .map((record) => {
+        const error = record.error || {};
+        const code = String(error.error_code || error.code || 'action_failed');
+        return {
+          executionId: record.executionId,
+          nodeId: record.nodeId,
+          code,
+          station: error.station ? String(error.station) : '',
+          plcAddress: error.plc_address ? String(error.plc_address) : '',
+          title: String(error.error_title || error.message || 'Action 执行失败'),
+          recovery: error.recovery ? String(error.recovery) : '',
+        };
+      }),
+    [selectedTaskInstance],
+  );
+  const taskPersistentAlarms = useMemo(
+    () => taskInstances.flatMap((task) => task.actionRecords
+      .filter((record) => record.status === 'failed' && record.error)
+      .map((record) => {
+        const error = record.error || {};
+        return {
+          key: `${task.id}-${record.executionId}`,
+          taskId: task.id,
+          templateId: task.templateId,
+          sample: task.sample,
+          code: String(error.error_code || error.code || 'action_failed'),
+          station: error.station ? String(error.station) : '',
+          plcAddress: error.plc_address ? String(error.plc_address) : '',
+          title: String(error.error_title || error.message || 'Action 执行失败'),
+          recovery: error.recovery ? String(error.recovery) : '',
+        };
+      })),
+    [taskInstances],
   );
   const taskLogLines = useMemo(
     () => taskLogSession
@@ -1370,6 +1532,7 @@ function App() {
     if (workspace !== 'tasks') return;
     let cancelled = false;
     taskLogBootstrappedRef.current = false;
+    setIsTaskLogBootstrapped(false);
     setTaskActionLogs([]);
     setTaskLogError('');
     void fetchTaskActionLogs(fetch, taskWorkspacePath, { afterSeq: 0 })
@@ -1377,11 +1540,13 @@ function App() {
         if (cancelled) return;
         taskLogAfterSeqRef.current = result.latest_seq;
         taskLogBootstrappedRef.current = true;
+        setIsTaskLogBootstrapped(true);
       })
       .catch(() => {
         if (cancelled) return;
         taskLogAfterSeqRef.current = 0;
         taskLogBootstrappedRef.current = true;
+        setIsTaskLogBootstrapped(true);
         setTaskLogError('日志暂不可用');
       });
     return () => {
@@ -1390,34 +1555,48 @@ function App() {
     };
   }, [taskWorkspacePath, workspace]);
   useEffect(() => {
-    if (workspace !== 'tasks' || !taskLogBootstrappedRef.current) return;
-    const poll = () => {
-      void fetchTaskActionLogs(fetch, taskWorkspacePath, {
-        afterSeq: taskLogAfterSeqRef.current,
-      })
-        .then((result) => {
-          setTaskLogError('');
-          if (result.entries.length) {
-            setTaskActionLogs((previous) => mergeTaskActionLogs(previous, result.entries));
-          }
-          if (result.latest_seq >= taskLogAfterSeqRef.current) {
-            taskLogAfterSeqRef.current = result.latest_seq;
-          }
-        })
-        .catch(() => {
-          setTaskLogError('日志暂不可用');
+    if (workspace !== 'tasks' || !isTaskLogBootstrapped || !taskLogBootstrappedRef.current) return;
+    let cancelled = false;
+    let inFlight = false;
+    const poll = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const result = await fetchAllTaskActionLogs(fetch, taskWorkspacePath, {
+          afterSeq: taskLogAfterSeqRef.current,
         });
+        if (cancelled) return;
+        setTaskLogError('');
+        if (result.entries.length) {
+          setTaskActionLogs((previous) => mergeTaskActionLogs(previous, result.entries));
+        }
+        if (result.next_after_seq >= taskLogAfterSeqRef.current) {
+          taskLogAfterSeqRef.current = result.next_after_seq;
+        }
+      } catch {
+        if (!cancelled) setTaskLogError('日志暂不可用');
+      } finally {
+        inFlight = false;
+      }
     };
-    poll();
-    const timer = window.setInterval(poll, 1000);
-    return () => window.clearInterval(timer);
-  }, [taskWorkspacePath, workspace]);
+    void poll();
+    const timer = window.setInterval(() => void poll(), 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [isTaskLogBootstrapped, taskWorkspacePath, workspace]);
   useEffect(() => {
-    if (workspace !== 'tasks' || !selectedTaskInstanceId || !taskLogBootstrappedRef.current) {
+    if (
+      workspace !== 'tasks'
+      || !selectedTaskInstanceId
+      || !isTaskLogBootstrapped
+      || !taskLogBootstrappedRef.current
+    ) {
       return;
     }
     let cancelled = false;
-    void fetchTaskActionLogs(fetch, taskWorkspacePath, {
+    void fetchAllTaskActionLogs(fetch, taskWorkspacePath, {
       afterSeq: 0,
       instanceId: selectedTaskInstanceId,
     })
@@ -1435,7 +1614,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [selectedTaskInstanceId, taskWorkspacePath, workspace]);
+  }, [isTaskLogBootstrapped, selectedTaskInstanceId, taskWorkspacePath, workspace]);
   const connectTaskOpc = useCallback(async () => {
     const url = taskOpcUrl.trim();
     if (!url) {
@@ -1779,7 +1958,11 @@ function App() {
           method: action.method,
           label: action.label,
           description: action.description,
-          params: buildDefaultParams(action.params || []),
+          params: stripAutomaticallyManagedActionParameters(
+            action.method,
+            buildDefaultParams(action.params || []),
+            id,
+          ),
           paramSpecs: action.params || [],
           opcVariables: action.opc_variables || [],
           runStatus: 'idle',
@@ -1938,6 +2121,12 @@ function App() {
         resources: [],
         input_triggers: [],
         output_triggers: [],
+        dependencies: draft.dependencies == null
+          ? null
+          : draft.dependencies.map((dependency) => ({
+              template_id: dependency.templateId,
+              node_id: dependency.nodeId,
+            })),
       });
       return response;
     });
@@ -2037,12 +2226,14 @@ function App() {
   }, [persistTaskTestMemory, showCanvasToast]);
 
   const createTaskInstances = useCallback(() => {
-    const templateIds = scheduledTemplateIdsRef.current;
+    const templateIds = orderSelectedTemplateIds(
+      taskTemplatesRef.current,
+      scheduledTemplateIdsRef.current,
+    );
     if (!templateIds.length) {
       setMessage('请先将 Task Template 拖入 Resource Schedule。');
       return;
     }
-    const samples = SAMPLE_NAMES.slice(0, taskSampleCount);
     const selectedTemplateIds = new Set(templateIds);
     const actionNodeCatalog = nodes.map((node) => ({
       id: node.id,
@@ -2068,19 +2259,25 @@ function App() {
           ),
         ]),
     );
-    void mutateTaskWorkspace((version) => taskApiRef.current.generateInstances(
-      taskWorkspacePath,
-      version,
-      templateIds,
-      samples,
-      taskSampleStartIntervalSeconds,
-      rememberedParametersForSamples(
-        taskTestMemoryRef.current,
-        samples,
+    void mutateTaskWorkspace((version) => {
+      const samples = generateSampleIds(
+        taskSampleCount,
+        taskInstancesRef.current.map((item) => item.sample),
+      );
+      return taskApiRef.current.generateInstances(
+        taskWorkspacePath,
+        version,
         templateIds,
-        parameterSchema,
-      ),
-    ));
+        samples,
+        taskSampleStartIntervalSeconds,
+        rememberedParametersForSamples(
+          taskTestMemoryRef.current,
+          samples,
+          templateIds,
+          parameterSchema,
+        ),
+      );
+    });
   }, [
     mutateTaskWorkspace,
     nodes,
@@ -2124,8 +2321,38 @@ function App() {
   }, [mutateTaskWorkspace, persistTaskTestMemory, taskWorkspacePath]);
 
   const advanceTaskSchedule = useCallback(() => {
+    if (!canStartTaskDispatch(visibleTaskDispatchReadiness)) {
+      showCanvasToast('派发预检尚未通过，请先处理阻断项');
+      return;
+    }
     void mutateTaskWorkspace((version) => taskApiRef.current.advance(taskWorkspacePath, version));
-  }, [mutateTaskWorkspace, taskWorkspacePath]);
+  }, [mutateTaskWorkspace, showCanvasToast, taskWorkspacePath, visibleTaskDispatchReadiness]);
+
+  const inspectTaskDispatchIssue = useCallback((issue: TaskDispatchPreflightIssue) => {
+    if (issue.node_id && nodes.some((node) => node.id === issue.node_id)) {
+      exitTaskTemplateEditing();
+      setNodes((current) => current.map((node) => ({
+        ...node,
+        selected: node.id === issue.node_id,
+      })));
+      setWorkspace('workflow');
+      setCanvasTab('workflow');
+      bumpViewportFit();
+      showCanvasToast(`已定位动作节点：${issue.node_id}`);
+      return;
+    }
+    if (
+      issue.template_id
+      && taskTemplates.some((template) => template.id === issue.template_id)
+    ) {
+      setSelectedTaskTemplateId(issue.template_id);
+      setTaskTemplateDrawerTab('templates');
+      setIsTaskDetailModalOpen(true);
+      showCanvasToast(`已打开 Task 模板：${issue.template_name || issue.template_id}`);
+      return;
+    }
+    showCanvasToast(taskDispatchIssueResolution(issue));
+  }, [bumpViewportFit, exitTaskTemplateEditing, nodes, showCanvasToast, taskTemplates]);
 
   const clearTaskQueue = useCallback(() => {
     if (!taskInstances.length) {
@@ -2150,6 +2377,93 @@ function App() {
     mutateTaskWorkspace,
     showCanvasToast,
     taskInstances.length,
+    taskWorkspacePath,
+  ]);
+
+  const resetTaskQueueProgress = useCallback(() => {
+    if (!taskInstancesRef.current.length) return;
+    if (isSchedulerRunning) {
+      showCanvasToast('请先暂停派发');
+      return;
+    }
+    const recoveryRequired = isTaskExecutionDraining || hasActiveServerExecution;
+    if (recoveryRequired) {
+      const confirmation = window.prompt(
+        '检测到残留在途动作。只有确认真机动作已停止且 Task OPC 已断开后才能恢复。请输入“已停止并断开”继续：',
+      );
+      if (confirmation?.trim() !== '已停止并断开') return;
+    } else if (!window.confirm(
+      `将当前 ${taskInstancesRef.current.length} 个 Task 全部恢复为未派发状态；Task、样品顺序和参数保持不变。是否继续？`,
+    )) {
+      return;
+    }
+    taskExecutionControllerRef.current?.pause();
+    setTaskExecutionWorkflow(null);
+    setTaskExecutionStatus(createTaskExecutionStatus());
+    setSelectedTaskInstanceId(null);
+    if (!recoveryRequired) {
+      void mutateTaskWorkspace((version) => taskApiRef.current.resetInstancesProgress(
+        taskWorkspacePath,
+        version,
+      ));
+      return;
+    }
+    void runTaskSchedulerTransition(
+      taskSchedulerTransitionRef,
+      setIsSchedulerTransitioning,
+      async () => {
+        let resetSucceeded = false;
+        await mutateTaskWorkspace(async () => {
+          let latest = await taskApiRef.current.getWorkspace(taskWorkspacePath);
+          if (!latest.workspace.scheduler_paused) {
+            throw new Error('服务端仍在派发，请先暂停后再清除残留动作');
+          }
+          const activeExecutions = latest.workspace.task_instances.flatMap((instance) => {
+            const nodeId = instance.execution_state?.active_node_id;
+            const executionId = instance.execution_state?.active_execution_id;
+            if (!nodeId || !executionId) return [];
+            const hasRunningRecord = (instance.execution_state?.records || []).some(
+              (record) => (
+                record.node_id === nodeId
+                && record.execution_id === executionId
+                && record.status === 'running'
+              ),
+            );
+            if (!hasRunningRecord) {
+              throw new Error(`Task ${instance.sample_id} 的残留动作记录不一致，未执行强制清除`);
+            }
+            return [{ instanceId: instance.id, nodeId, executionId }];
+          });
+          for (const execution of activeExecutions) {
+            latest = await taskApiRef.current.failAction(
+              taskWorkspacePath,
+              latest.version,
+              execution.instanceId,
+              execution.nodeId,
+              execution.executionId,
+              {
+                type: 'ManualRecovery',
+                code: 'manual_stale_action_clear',
+                message: '用户在前端确认真机动作已停止且 Task OPC 已断开；清除残留执行并重置复用',
+              },
+            );
+          }
+          const response = await taskApiRef.current.resetInstancesProgress(
+            taskWorkspacePath,
+            latest.version,
+          );
+          resetSucceeded = true;
+          return response;
+        });
+        if (resetSucceeded) showCanvasToast('已清除残留执行，Task 已重置并可复用');
+      },
+    );
+  }, [
+    hasActiveServerExecution,
+    isSchedulerRunning,
+    isTaskExecutionDraining,
+    mutateTaskWorkspace,
+    showCanvasToast,
     taskWorkspacePath,
   ]);
 
@@ -2178,6 +2492,12 @@ function App() {
         resources: template.resources,
         input_triggers: template.inputTriggers.map(taskTriggerForExport),
         output_triggers: template.outputTriggers.map(taskTriggerForExport),
+        dependencies: template.dependencies == null
+          ? null
+          : template.dependencies.map((dependency) => ({
+              template_id: dependency.templateId,
+              node_id: dependency.nodeId,
+            })),
       })),
     });
     showCanvasToast(isSingle ? '已下载 Task 模板' : `已下载 ${templates.length} 个 Task 模板`);
@@ -2253,6 +2573,7 @@ function App() {
     if (!executionPlan.executableNodes.length) {
       throw new Error('当前没有可执行节点，请调整起始节点或禁用状态');
     }
+    const semanticKey = taskWorkflowSemanticKey;
     const request = createWorkflowRequest(workflowName, executionPlan.executableNodes, executionPlan.executableEdges);
     const response = await fetch('/api/workflow/build-graph', {
       method: 'POST',
@@ -2264,9 +2585,40 @@ function App() {
       throw new Error(payload.detail || '生成 workflow 失败');
     }
     setWorkflow(payload);
+    setBuiltWorkflowSemanticKey(semanticKey);
     setMessage('');
     return payload as WorkflowJson;
-  }, [executionPlan.executableEdges, executionPlan.executableNodes, workflowName]);
+  }, [executionPlan.executableEdges, executionPlan.executableNodes, taskWorkflowSemanticKey, workflowName]);
+
+  const runTaskDispatchPreflight = useCallback(async (
+    workflowPayload: WorkflowJson,
+    signal?: AbortSignal,
+  ) => {
+    let expectedVersion = taskWorkspaceVersionRef.current;
+    if (expectedVersion === null) throw new Error('Task 工作区尚未加载');
+    try {
+      return await preflightTaskDispatch({
+        workflowPath: taskWorkspacePath,
+        expectedVersion,
+        workflow: workflowPayload as Record<string, unknown>,
+        signal,
+      });
+    } catch (error) {
+      if (!(error instanceof TaskDispatchPreflightHttpError) || error.status !== 409) {
+        throw error;
+      }
+    }
+    const latest = await taskApiRef.current.getWorkspace(taskWorkspacePath, signal);
+    expectedVersion = latest.version;
+    const result = await preflightTaskDispatch({
+      workflowPath: taskWorkspacePath,
+      expectedVersion,
+      workflow: workflowPayload as Record<string, unknown>,
+      signal,
+    });
+    if (!signal?.aborted) applyTaskWorkspace(latest);
+    return result;
+  }, [applyTaskWorkspace, taskWorkspacePath]);
 
   const generateOpcSimulatorProfile = useCallback(async () => {
     if (opcSimulatorGenerateInFlightRef.current) return;
@@ -2311,6 +2663,12 @@ function App() {
             resources: template.resources,
             input_triggers: [],
             output_triggers: [],
+            dependencies: template.dependencies == null
+              ? null
+              : template.dependencies.map((dependency) => ({
+                  template_id: dependency.templateId,
+                  node_id: dependency.nodeId,
+                })),
           })),
           scheduled_template_ids: scheduledOpcTemplateIds,
           action_catalog: actionCatalog,
@@ -2844,12 +3202,32 @@ function App() {
     performTaskSchedulerPause,
   ), [performTaskSchedulerPause]);
 
+  const retryTaskDispatchPreflight = useCallback(() => {
+    if (isSchedulerRunning || isTaskExecutionDraining || isSchedulerTransitioning) return;
+    setTaskDispatchReadiness({
+      status: 'stale',
+      key: taskDispatchPreflightKeyRef.current,
+      message: '正在重新发起派发预检',
+      source: 'automatic',
+    });
+    setTaskServiceError('');
+    setTaskDispatchPreflightRevision((current) => current + 1);
+  }, [isSchedulerRunning, isSchedulerTransitioning, isTaskExecutionDraining]);
+
   const handleTaskSchedulerToggle = useCallback(() => runTaskSchedulerTransition(
     taskSchedulerTransitionRef,
     setIsSchedulerTransitioning,
     async () => {
       if (isSchedulerRunning || isTaskExecutionDraining) {
         await performTaskSchedulerPause();
+        return;
+      }
+      if (!canStartTaskDispatch(visibleTaskDispatchReadiness)) {
+        setTaskServiceError('派发预检尚未通过，请先处理阻断项');
+        return;
+      }
+      if (!isTaskLogBootstrapped || !taskLogBootstrappedRef.current) {
+        setTaskServiceError('Task 日志正在初始化，请稍后重试');
         return;
       }
       taskExecutionControllerRef.current?.pause();
@@ -2863,12 +3241,59 @@ function App() {
         setTaskServiceError(error instanceof Error ? error.message : '构建 Task workflow 失败');
         return;
       }
-      setTaskExecutionWorkflow(builtWorkflow);
-      const version = taskWorkspaceVersionRef.current;
-      if (version === null) {
-        setTaskServiceError('Task 工作区尚未加载');
+      const preflightKey = taskDispatchPreflightKeyRef.current;
+      setTaskDispatchReadiness({
+        status: 'validating',
+        key: preflightKey,
+        message: '开始派发前正在执行最终确认',
+        source: 'dispatch',
+      });
+      let finalPreflight: TaskDispatchPreflightResult;
+      try {
+        finalPreflight = await runTaskDispatchPreflight(builtWorkflow);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : '派发最终确认失败';
+        setTaskDispatchReadiness({
+          status: 'unavailable',
+          key: taskDispatchPreflightKeyRef.current,
+          message: errorMessage,
+          source: 'dispatch',
+        });
+        setTaskServiceError(errorMessage);
         return;
       }
+      if (taskDispatchPreflightKeyRef.current !== preflightKey) {
+        setTaskDispatchReadiness({
+          status: 'stale',
+          key: taskDispatchPreflightKeyRef.current,
+          message: '最终确认期间派发内容已变化，请等待重新预检',
+          source: 'dispatch',
+        });
+        setTaskServiceError('最终确认期间派发内容已变化，请重新确认');
+        return;
+      }
+      setTaskDispatchReadiness({
+        status: finalPreflight.valid ? 'ready' : 'invalid',
+        key: preflightKey,
+        result: finalPreflight,
+        message: finalPreflight.valid
+          ? '开始派发前最终确认通过'
+          : '开始派发前最终确认未通过',
+        source: 'dispatch',
+      });
+      if (!finalPreflight.valid) {
+        setTaskServiceError(
+          finalPreflight.errors[0]?.message || '派发最终确认未通过',
+        );
+        return;
+      }
+      setTaskExecutionWorkflow(builtWorkflow);
+      const version = finalPreflight.workspace_version;
+      // 会话边界必须早于 plan/advance，否则首条 scheduled 事件会被过滤。
+      setTaskLogSession({
+        startedAt: Date.now(),
+        actionAfterSeq: taskLogAfterSeqRef.current,
+      });
       try {
         const hasRunningPeer = taskInstancesRef.current.some(
           (instance) => instance.status === 'running',
@@ -2885,10 +3310,6 @@ function App() {
           plannedWorkspace.version,
         );
         applyTaskWorkspace(advancedWorkspace);
-        setTaskLogSession({
-          startedAt: Date.now(),
-          actionAfterSeq: taskLogAfterSeqRef.current,
-        });
       } catch (error) {
         const message = taskApiErrorMessage(error);
         try {
@@ -2902,10 +3323,13 @@ function App() {
   ), [
     applyTaskWorkspace,
     buildWorkflow,
+    isTaskLogBootstrapped,
     isSchedulerRunning,
     isTaskExecutionDraining,
     performTaskSchedulerPause,
+    runTaskDispatchPreflight,
     taskWorkspacePath,
+    visibleTaskDispatchReadiness,
   ]);
 
   const shouldRunTaskExecutionLoop = (
@@ -2914,7 +3338,11 @@ function App() {
     || hasActiveServerExecution
   );
   useEffect(() => {
-    if (!shouldRunTaskExecutionLoop || (!isTaskExecutionDraining && !hasActiveServerExecution && !taskExecutionWorkflow)) return;
+    if (
+      isSchedulerTransitioning
+      || !shouldRunTaskExecutionLoop
+      || (!isTaskExecutionDraining && !hasActiveServerExecution && !taskExecutionWorkflow)
+    ) return;
     const controller = taskExecutionControllerRef.current;
     if (!controller) return;
     if (!controller.isRunning()) controller.start();
@@ -2928,6 +3356,7 @@ function App() {
     return () => window.clearInterval(timer);
   }, [
     hasActiveServerExecution,
+    isSchedulerTransitioning,
     isTaskExecutionDraining,
     shouldRunTaskExecutionLoop,
     taskExecutionWorkflow,
@@ -2935,12 +3364,6 @@ function App() {
   ]);
 
   useEffect(() => () => taskExecutionControllerRef.current?.pause(), []);
-
-  useEffect(() => {
-    if (workspace !== 'tasks' && (isSchedulerRunning || isTaskExecutionDraining)) {
-      void handleTaskSchedulerPause();
-    }
-  }, [handleTaskSchedulerPause, isSchedulerRunning, isTaskExecutionDraining, workspace]);
 
   const exportPseudoFlow = () => {
     try {
@@ -2965,8 +3388,18 @@ function App() {
     if (!file) return;
 
     try {
+      // 服务重启后 preset 目录可能仍在异步加载；导入前主动刷新，避免用空的
+      // 或旧的动作目录误报“当前 preset 不包含动作”。
+      const presetResponse = await fetch('/api/preset', { cache: 'no-store' });
+      if (!presetResponse.ok) {
+        throw new Error(`读取当前 preset 失败（HTTP ${presetResponse.status}）`);
+      }
+      const presetPayload = await presetResponse.json() as PresetPayload;
+      const importActions = presetPayload.actions || [];
+      actionsRef.current = importActions;
+      setActions(importActions);
       const parsed = JSON.parse(await file.text());
-      const imported = createImportedDraft(parsed, actions, { autoLayout: true }) as {
+      const imported = createImportedDraft(parsed, importActions, { autoLayout: true }) as {
         name: string;
         nodes: Node<ActionNodeData>[];
         edges: Edge[];
@@ -3005,6 +3438,89 @@ function App() {
     }, 250);
     return () => window.clearTimeout(timer);
   }, [draftKey, nodes.length, startNodeId]);
+
+  useEffect(() => {
+    if (workspace !== 'tasks') return;
+    const key = taskDispatchPreflightKey;
+    if (isSchedulerRunning || isTaskExecutionDraining) {
+      setTaskDispatchReadiness((current) => {
+        const visible = currentTaskDispatchReadiness(current, key);
+        if (
+          isTaskExecutionDraining
+          && visible.status === 'invalid'
+          && visible.source === 'dispatch'
+        ) return current;
+        return {
+          status: 'stale',
+          key,
+          message: '调度运行中，暂停后将重新验证派发条件',
+        };
+      });
+      return;
+    }
+    if (isTaskWorkspaceLoading || !hasTaskWorkspaceVersion) {
+      setTaskDispatchReadiness({
+        status: 'stale',
+        key,
+        message: '等待 Task 工作区加载完成',
+      });
+      return;
+    }
+    if (!workflow || builtWorkflowSemanticKey !== taskWorkflowSemanticKey) {
+      setTaskDispatchReadiness({
+        status: 'stale',
+        key,
+        message: '等待当前流程构建完成',
+      });
+      return;
+    }
+
+    const controller = new AbortController();
+    setTaskDispatchReadiness({ status: 'validating', key });
+    const timer = window.setTimeout(() => {
+      const run = async () => {
+        try {
+          const result = await runTaskDispatchPreflight(
+            workflow,
+            controller.signal,
+          );
+          if (controller.signal.aborted) return;
+          setTaskDispatchReadiness({
+            status: result.valid ? 'ready' : 'invalid',
+            key,
+            result,
+            source: 'automatic',
+          });
+        } catch (error) {
+          if (
+            controller.signal.aborted
+            || (error instanceof DOMException && error.name === 'AbortError')
+          ) return;
+          setTaskDispatchReadiness({
+            status: 'unavailable',
+            key,
+            message: error instanceof Error ? error.message : '派发预检失败',
+          });
+        }
+      };
+      void run();
+    }, 300);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [
+    builtWorkflowSemanticKey,
+    hasTaskWorkspaceVersion,
+    isSchedulerRunning,
+    isTaskExecutionDraining,
+    isTaskWorkspaceLoading,
+    runTaskDispatchPreflight,
+    taskDispatchPreflightKey,
+    taskDispatchPreflightRevision,
+    taskWorkflowSemanticKey,
+    workspace,
+  ]);
 
   const runWorkflow = async () => {
     try {
@@ -3117,8 +3633,9 @@ function App() {
           </dl>
         ) : (
           <TaskSchedulerHeaderActions
+            dispatchReadiness={visibleTaskDispatchReadiness}
             environment={taskExecutionEnvironment}
-            isRunning={isSchedulerRunning}
+            isRunning={isSchedulerRunning || isTaskExecutionDraining}
             isTransitioning={isSchedulerTransitioning}
             onConnectOpc={() => void connectTaskOpc()}
             onEnvironmentChange={(environment) => {
@@ -3539,11 +4056,23 @@ function App() {
       {workspace === 'tasks' && (
         <TaskSchedulerBench
           environment={taskExecutionEnvironment}
+          dispatchReadiness={visibleTaskDispatchReadiness}
           events={taskEvents}
-          isRunning={isSchedulerRunning}
+          isRunning={isSchedulerRunning || isTaskExecutionDraining}
           isTransitioning={isSchedulerTransitioning}
           onAdvance={advanceTaskSchedule}
           onClear={clearTaskQueue}
+          onInspectDispatchIssue={inspectTaskDispatchIssue}
+          onResetProgress={resetTaskQueueProgress}
+          onRetryDispatchPreflight={retryTaskDispatchPreflight}
+          resetProgressRecoveryRequired={isTaskExecutionDraining || hasActiveServerExecution}
+          resetProgressDisabled={
+            !taskInstances.length
+            || isTaskWorkspaceLoading
+            || isSchedulerRunning
+            || isSchedulerTransitioning
+            || taskMutationInFlightCount > 0
+          }
           onClearTemplates={clearTaskTemplates}
           onDeleteSelectedTemplates={() => deleteTaskTemplates(scheduledTemplateIds, 'selected')}
           onDeleteTemplate={(templateId) => deleteTaskTemplates([templateId], 'single')}
@@ -3633,6 +4162,7 @@ function App() {
           opcUrl={taskOpcUrl}
           processLines={selectedTaskProcessLines}
           logLines={taskLogLines}
+          logError={taskLogError}
           variableRows={selectedTaskVariableRows}
           waitingReasons={taskWaitingReasons}
         />
@@ -3918,7 +4448,7 @@ function App() {
                   <input
                     type="number"
                     min={1}
-                    max={5}
+                    max={999}
                     step={1}
                     value={taskSampleCount}
                     onChange={(event) => updateTaskSampleCount(Number(event.target.value))}
@@ -4141,6 +4671,31 @@ function App() {
                   {' · '}failed {taskExecutionStatus.tick.failed}
                 </span>
               </div>
+              {taskPersistentAlarms.length > 0 && (
+                <section aria-live="assertive" className="task-persistent-alarm" role="alert">
+                  <h3>设备运行报错</h3>
+                  {taskPersistentAlarms.map((error) => (
+                    <button
+                      key={error.key}
+                      onClick={() => {
+                        setSelectedTaskInstanceId(error.taskId);
+                        setSelectedTaskTemplateId(error.templateId);
+                        setTaskLogTab('action');
+                      }}
+                      type="button"
+                    >
+                      <strong>报错码：{error.code}</strong>
+                      <span>
+                        {error.sample}
+                        {error.station ? ` · 工站：${error.station}` : ''}
+                        {error.plcAddress ? ` · PLC 地址：${error.plcAddress}` : ''}
+                      </span>
+                      <span>错误：{error.title}</span>
+                      {error.recovery ? <span>处理建议：{error.recovery}</span> : null}
+                    </button>
+                  ))}
+                </section>
+              )}
               <div className="task-queue-table-head" aria-hidden="true">
                 <span>样品</span>
                 <span>当前 Task</span>
@@ -4176,6 +4731,9 @@ function App() {
                     .sort((left, right) => left.order - right.order);
                   const queueIndex = sampleQueue.findIndex((item) => item.id === task.id);
                   const canReorder = !isSchedulerRunning && (task.status === 'waiting' || task.status === 'pending');
+                  const persistentError = task.actionRecords.find(
+                    (record) => record.status === 'failed' && record.error,
+                  )?.error;
                   return (
                     <article className={`task-queue-card ${state}`} key={task.id}>
                       <div>
@@ -4183,6 +4741,13 @@ function App() {
                         <span>{task.startedAt
                           ? `运行记录：${new Date(task.startedAt).toLocaleTimeString('zh-CN', { hour12: false })}`
                           : statusDetail}</span>
+                        {persistentError ? (
+                          <span className="task-queue-error-summary">
+                            报错码：{String(persistentError.error_code || persistentError.code || 'action_failed')}
+                            {persistentError.plc_address ? ` · PLC：${String(persistentError.plc_address)}` : ''}
+                            {persistentError.error_title ? ` · ${String(persistentError.error_title)}` : ''}
+                          </span>
+                        ) : null}
                       </div>
                       <div className="task-queue-actions">
                         <button
@@ -4321,6 +4886,18 @@ function App() {
                 {!selectedTaskInstance && (
                   <div className="task-empty">未选择 Task 实例。</div>
                 )}
+                {selectedTaskPersistentErrors.map((error) => (
+                  <div
+                    className="task-process-log-error"
+                    key={`persistent-error-${error.executionId}`}
+                  >
+                    <strong>报错码：{error.code}</strong>
+                    {error.station ? ` · 工站：${error.station}` : ''}
+                    {error.plcAddress ? ` · PLC 地址：${error.plcAddress}` : ''}
+                    {` · 错误：${error.title}`}
+                    {error.recovery ? ` · 处理建议：${error.recovery}` : ''}
+                  </div>
+                ))}
                 {selectedTaskInstance && selectedTaskLogSections.map((section) => {
                   const variableRows = buildTaskVariableRows(section.entries);
                   const processLines = buildTaskProcessLogLines(section.entries);
@@ -4358,7 +4935,12 @@ function App() {
                       {processLines.length ? (
                         <div className="task-process-log-list">
                           {processLines.map((line) => (
-                            <div key={`${line.seq}-${line.message}`}>
+                            <div
+                              className={line.level === 'error' || line.level === 'critical'
+                                ? 'task-process-log-error'
+                                : undefined}
+                              key={`${line.seq}-${line.message}`}
+                            >
                               {new Date(line.timestamp).toLocaleTimeString()}
                               {' · '}
                               {line.message}
@@ -4369,7 +4951,7 @@ function App() {
                     </div>
                   );
                 })}
-                {selectedTaskInstance && !selectedTaskLogSections.length && (
+                {selectedTaskInstance && !selectedTaskLogSections.length && !selectedTaskPersistentErrors.length && (
                   <div className="task-empty">该工艺尚未产生运行日志，派发 Action 后会在此显示。</div>
                 )}
               </section>}
@@ -4593,7 +5175,7 @@ function App() {
                       ] as const).map(([field, label, type]) => <label key={field}>
                         <span className="param-label">{label}</span>
                         <input
-                          min={type === 'number' ? (field === 'target_weight' ? 0 : 1) : undefined}
+                          min={type === 'number' ? 0 : undefined}
                           max={type === 'number' && field !== 'target_weight' ? 10 : undefined}
                           onChange={(event) => updateAdditions(additions.map((item, index) => index === additionIndex
                             ? { ...item, [field]: event.currentTarget.value }
@@ -4629,10 +5211,10 @@ function App() {
                       <input min={1} onChange={(event) => {
                         const count = Math.max(1, Math.floor(Number(event.currentTarget.value) || 1));
                         const next = additions.slice(0, count);
-                        while (next.length < count) next.push({ liquid_station_index: 1, solvent_batch_id: '', volume: '' });
+                        while (next.length < count) next.push({ liquid_station_index: 1, solvent_batch_id: '', volume: '', reuse_tip: true });
                         updateAdditions(next);
                       }} step={1} type="number" value={additions.length} />
-                      <small>测密度前需要依次加入的液体数量。</small>
+                      <small>本次加液动作需要依次加入的液体数量。</small>
                     </label>
                     {additions.map((addition, additionIndex) => <fieldset key={additionIndex}>
                       <legend>液体 {additionIndex + 1}</legend>
@@ -4653,6 +5235,12 @@ function App() {
                           }}
                           step={field === 'liquid_station_index' ? 1 : 'any'} type={type} value={String(addition[field] ?? '')} />
                       </label>)}
+                      <label><span className="param-label">复用此液体 TIP</span>
+                        <input checked={addition.reuse_tip}
+                          onChange={(event) => updateAdditions(additions.map((item, index) => index === additionIndex
+                            ? { ...item, reuse_tip: event.currentTarget.checked } : item))} type="checkbox" />
+                        <small>勾选时复用同工位、同溶剂批次绑定的 TIP；取消勾选时使用新 TIP。</small>
+                      </label>
                     </fieldset>)}
                     <label><span className="param-label">执行前初始化 TIP 库存</span>
                       <input checked={Boolean(editingNode.data.params.initialize_tip_inventory)}
@@ -4670,6 +5258,11 @@ function App() {
                   .filter((param) => (
                     (editingNode.data.method !== 'dose_powder' || !CANVAS_S07_POWDER_PARAMETERS.has(String(param.name)))
                     && (editingNode.data.method !== 'add_liquid_with_reusable_tip' || !CANVAS_S09_LIQUID_PARAMETERS.has(String(param.name)))
+                    && !isAutomaticallyManagedActionParameter(
+                      editingNode.data.method,
+                      String(param.name || ''),
+                      editingNode.id,
+                    )
                   ))
                   .map((param) => {
                   const name = param.name || '';
@@ -4718,6 +5311,25 @@ function App() {
                     </label>
                   );
                 })}
+                {editingNode.data.paramSpecs.some((param) => isAutomaticallyManagedActionParameter(
+                  editingNode.data.method,
+                  String(param.name || ''),
+                  editingNode.id,
+                )) ? <p className="scheduler-bench__inherited-parameter">
+                  {editingNode.data.paramSpecs
+                    .filter((param) => isAutomaticallyManagedActionParameter(
+                      editingNode.data.method,
+                      String(param.name || ''),
+                      editingNode.id,
+                    ))
+                    .map((param) => automaticActionParameterDescription(
+                      editingNode.data.method,
+                      String(param.name || ''),
+                      editingNode.id,
+                    ))
+                    .filter(Boolean)
+                    .join('；')}
+                </p> : null}
               </div>
             ) : (
               <div className="empty-state">该动作没有可编辑参数。</div>
